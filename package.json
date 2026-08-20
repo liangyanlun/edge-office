@@ -1,0 +1,15 @@
+{
+  "name": "edge-office-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": ".\\.venv\\Scripts\\python.exe run_flask.py",
+    "start:node": "node server.mjs",
+    "test": "node --test",
+    "test:backend": ".\\.venv\\Scripts\\python.exe -m pytest tests_py"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

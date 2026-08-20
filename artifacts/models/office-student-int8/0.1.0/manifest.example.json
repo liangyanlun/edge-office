@@ -1,0 +1,14 @@
+{
+  "id": "office-student-int8",
+  "version": "0.1.0",
+  "format": "onnx",
+  "quantization": "int8",
+  "task": "office-rag-generation",
+  "weights": "weights/model.onnx",
+  "tokenizer": "tokenizer/",
+  "promptTemplate": "prompt-template.txt",
+  "maxInputTokens": 2048,
+  "maxOutputTokens": 256,
+  "license": "填写模型许可证",
+  "sha256": "填写权重 SHA-256"
+}

@@ -1,0 +1,30 @@
+# Python and Node local environments
+.venv/
+node_modules/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local runtime data and generated indexes
+artifacts/data/
+artifacts/indexes/
+artifacts/evaluations/
+artifacts/models/*
+!artifacts/models/README.md
+!artifacts/models/office-student-int8/
+!artifacts/models/office-student-int8/0.1.0/
+!artifacts/models/office-student-int8/0.1.0/manifest.example.json
+
+# Large model weights and local secrets
+*.gguf
+*.safetensors
+*.bin
+.env
+.env.*
+!.env.example
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
