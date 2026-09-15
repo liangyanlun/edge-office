@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import secrets
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -105,12 +106,16 @@ class AgentOrchestrator:
         self.rag_top_k = max(1, min(int(rag_top_k), 4))
         self.confirmation_ttl_seconds = max(30, min(int(confirmation_ttl_seconds), 3600))
         self.user_id = user_id
+        # Confirmation capabilities never cross the browser boundary. Losing
+        # this process-local state on restart invalidates pending plans safely.
+        self._confirmation_lock = threading.Lock()
+        self._pending_confirmations: dict[str, tuple[str, str, str]] = {}
 
     @staticmethod
     def tools() -> list[dict[str, Any]]:
         return [{"name": item.name, "label": item.label, "riskClass": item.risk_class, "permission": item.permission, "requiresConfirmation": item.name in HIGH_RISK, "sandbox": True, "schema": {key: {"type": typ.__name__, "required": required} for key, (typ, required) in item.fields.items()}} for item in TOOL_REGISTRY.values()]
 
-    def plan(self, message: str, conversation_id: str | None, rag_enabled: bool, request_id: str) -> dict[str, Any]:
+    def plan(self, message: str, conversation_id: str | None, rag_enabled: bool, request_id: str, session_id: str | None = None) -> dict[str, Any]:
         raw_output = ""
         try:
             raw_output = self.inference.create_action_plan(message, self.candidate_tools(message, rag_enabled))
@@ -118,6 +123,7 @@ class AgentOrchestrator:
         except (RuntimeError, PlanValidationError):
             action_plan = self._fallback_plan(message, rag_enabled)
             raw_output = canonical_json(action_plan)
+        action_plan = self._bind_trusted_request_fields(action_plan, message)
         tool = TOOL_REGISTRY[action_plan["tool"]]
         canonical_plan = canonical_json({"tool": tool.name, "arguments": action_plan["arguments"]})
         plan_hash = hashlib.sha256((POLICY_VERSION + "\n" + canonical_plan).encode("utf-8")).hexdigest()
@@ -125,24 +131,38 @@ class AgentOrchestrator:
         plan = self.database.create_agent_plan(
             request_id=request_id, conversation_id=conversation_id, tool=tool.name, arguments=action_plan["arguments"], canonical_json=canonical_plan, plan_sha256=plan_hash,
             risk_class=tool.risk_class, policy_version=POLICY_VERSION, model_name=self.inference.status()["name"], model_output_sha256=hashlib.sha256(raw_output.encode("utf-8")).hexdigest(),
+            request_input_sha256=hashlib.sha256(message.encode("utf-8")).hexdigest(),
             status="AWAITING_CONFIRMATION" if needs_confirmation else "VALIDATED", expires_in_seconds=self.confirmation_ttl_seconds if needs_confirmation else None,
         )
         if needs_confirmation:
+            bound_user_id = session_id or self.user_id
             nonce = secrets.token_urlsafe(24)
-            confirmation_id = self.database.create_confirmation(plan["id"], plan_hash, self.user_id, plan["expiresAt"], hashlib.sha256(nonce.encode()).hexdigest())
+            confirmation_id = self.database.create_confirmation(plan["id"], plan_hash, bound_user_id, plan["expiresAt"], hashlib.sha256(nonce.encode()).hexdigest())
+            with self._confirmation_lock:
+                self._pending_confirmations[plan["id"]] = (confirmation_id, nonce, bound_user_id)
             plan = self.database.get_agent_plan(plan["id"]) or plan
-            plan.update({"confirmationId": confirmation_id, "confirmationNonce": nonce})
         return plan
+
+    @staticmethod
+    def _bind_trusted_request_fields(action_plan: dict[str, Any], message: str) -> dict[str, Any]:
+        """Bind document retrieval to the original trusted user request."""
+        if action_plan["tool"] not in {"document_search", "document_quote"}:
+            return action_plan
+        return {
+            **action_plan,
+            "arguments": {**action_plan["arguments"], "query": message.strip()},
+            "confirmed": False,
+        }
 
     @staticmethod
     def candidate_tools(message: str, rag_enabled: bool = True) -> list[dict[str, Any]]:
         """Trusted intent gate: small models fill parameters, never broaden tool authority."""
         def select(name: str) -> list[dict[str, Any]]:
             item = next(tool for tool in AgentOrchestrator.tools() if tool["name"] == name)
-            # Keep only mandatory keys in the grammar. Optional data is retained in
-            # the user message/draft text, while this prevents a small model from
-            # spending its output budget hallucinating long participant lists.
-            return [{**item, "schema": {key: spec for key, spec in item["schema"].items() if spec["required"]}}]
+            # The intent gate narrows to one tool, but its argument contract remains
+            # identical to the frozen training registry. Optional values may be
+            # omitted; they must never be renamed or replaced with invented fields.
+            return [item]
 
         text, lower = message.strip(), message.lower()
         email = re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", text)
@@ -170,52 +190,82 @@ class AgentOrchestrator:
             return select("respond_without_tool")
         return select("document_search")
 
-    def execute(self, message: str, conversation_id: str, rag_enabled: bool, request_id: str | None = None) -> tuple[str, list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
+    def execute(self, message: str, conversation_id: str, rag_enabled: bool, request_id: str | None = None, session_id: str | None = None) -> tuple[str, list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
         request_id = request_id or secrets.token_hex(16)
-        plan = self.plan(message, conversation_id, rag_enabled, request_id)
+        planning_started = time.perf_counter()
+        plan = self.plan(message, conversation_id, rag_enabled, request_id, session_id=session_id)
+        planning_ms = max(1, round((time.perf_counter() - planning_started) * 1000))
         tool = TOOL_REGISTRY[plan["tool"]]
         events = [{"event": "plan", "data": self._plan_event(plan)}]
         if plan["status"] == "AWAITING_CONFIRMATION":
-            return self._preview(plan), [], {"action": tool.legacy_action, "tool": tool.name, "durationMs": 0, "runId": plan["id"], "plan": plan}, events
-        answer, citations, duration_ms = self._execute_plan(plan, rag_enabled, request_id)
+            return self._preview(plan), [], {"action": tool.legacy_action, "tool": tool.name, "durationMs": 0, "runId": plan["id"], "plan": plan, "timings": {"planningMs": planning_ms}}, events
+        answer, citations, duration_ms, timings = self._execute_plan(plan, rag_enabled, request_id)
+        timings["planningMs"] = planning_ms
         events += [{"event": "tool_start", "data": {"action": tool.name, "label": tool.label}}, {"event": "tool_result", "data": {"action": tool.name, "durationMs": duration_ms}}]
-        return answer, citations, {"action": tool.legacy_action, "tool": tool.name, "durationMs": duration_ms, "runId": plan["id"], "plan": self.database.get_agent_plan(plan["id"])}, events
+        return answer, citations, {"action": tool.legacy_action, "tool": tool.name, "durationMs": duration_ms, "runId": plan["id"], "plan": self.database.get_agent_plan(plan["id"]), "timings": timings}, events
 
-    def confirm(self, plan_id: str, confirmation_id: str, nonce: str, request_id: str | None = None) -> dict[str, Any]:
+    def confirm(self, plan_id: str, session_id: str | None = None, request_id: str | None = None) -> dict[str, Any]:
         plan = self.database.get_agent_plan(plan_id)
         if not plan:
             raise PlanValidationError("PLAN_NOT_FOUND", "计划不存在")
-        result = self.database.consume_confirmation(plan_id, confirmation_id, plan["planHash"], self.user_id, hashlib.sha256(nonce.encode()).hexdigest())
+        with self._confirmation_lock:
+            credentials = self._pending_confirmations.get(plan_id)
+            if credentials is None:
+                raise PlanValidationError("CONFIRMATION_SESSION_LOST", "确认会话已失效，请重新生成计划")
+            confirmation_id, nonce, bound_user_id = credentials
+            if (session_id or self.user_id) != bound_user_id:
+                raise PlanValidationError("CONFIRMATION_SESSION_MISMATCH", "该计划不属于当前本地会话")
+            result = self.database.consume_confirmation(plan_id, confirmation_id, plan["planHash"], bound_user_id, hashlib.sha256(nonce.encode()).hexdigest())
+            self._pending_confirmations.pop(plan_id, None)
         if result != "CONFIRMED":
             raise PlanValidationError(f"CONFIRMATION_{result}", "确认已失效、被取消或已使用")
         updated = self.database.get_agent_plan(plan_id)
         assert updated is not None
-        answer, citations, duration_ms = self._execute_plan(updated, True, request_id or updated["requestId"])
-        return {"plan": self.database.get_agent_plan(plan_id), "answer": answer, "citations": citations, "durationMs": duration_ms}
+        answer, citations, duration_ms, timings = self._execute_plan(updated, True, request_id or updated["requestId"])
+        return {"plan": self.database.get_agent_plan(plan_id), "answer": answer, "citations": citations, "durationMs": duration_ms, "timings": timings}
 
-    def cancel(self, plan_id: str) -> dict[str, Any]:
+    def cancel(self, plan_id: str, session_id: str | None = None) -> dict[str, Any]:
+        with self._confirmation_lock:
+            credentials = self._pending_confirmations.get(plan_id)
+            if credentials is not None and (session_id or self.user_id) != credentials[2]:
+                raise PlanValidationError("CONFIRMATION_SESSION_MISMATCH", "该计划不属于当前本地会话")
         result = self.database.cancel_agent_plan(plan_id)
         if result == "NOT_FOUND":
             raise PlanValidationError("PLAN_NOT_FOUND", "计划不存在")
         if result != "CANCELLED":
             raise PlanValidationError("PLAN_NOT_CANCELLABLE", "该计划已不能取消")
+        with self._confirmation_lock:
+            self._pending_confirmations.pop(plan_id, None)
         return self.database.get_agent_plan(plan_id) or {}
 
-    def _execute_plan(self, plan: dict[str, Any], rag_enabled: bool, request_id: str) -> tuple[str, list[dict[str, Any]], int]:
+    def _execute_plan(self, plan: dict[str, Any], rag_enabled: bool, request_id: str) -> tuple[str, list[dict[str, Any]], int, dict[str, Any]]:
         current = self.database.get_agent_plan(plan["id"])
         if not current or current["status"] not in {"VALIDATED", "CONFIRMED"}:
             raise PlanValidationError("PLAN_NOT_EXECUTABLE", "计划当前不能执行")
         self.database.update_agent_plan_status(plan["id"], "EXECUTING", "EXECUTING", {})
         attempt_id = self.database.create_tool_attempt(plan["id"], f"plan:{plan['id']}")
         started, citations = time.perf_counter(), []
+        timings: dict[str, Any] = {
+            "retrievalMs": None,
+            "modelGenerationMs": None,
+            "promptTokens": None,
+            "completionTokens": None,
+            "tokensPerSecond": None,
+        }
+        self.inference.reset_generation_metrics()
         tool, arguments = plan["tool"], plan["arguments"]
         try:
             if tool in {"document_search", "document_quote"}:
-                citations = self.rag.search(arguments["query"], int(arguments.get("top_k", self.rag_top_k)), request_id=request_id) if rag_enabled else []
+                if rag_enabled:
+                    retrieval_started = time.perf_counter()
+                    citations = self.rag.search(arguments["query"], int(arguments.get("top_k", self.rag_top_k)), request_id=request_id)
+                    timings["retrievalMs"] = max(1, round((time.perf_counter() - retrieval_started) * 1000))
                 answer = self.inference.compose_answer(arguments["query"], citations, rag_enabled, "search_knowledge")
+                timings.update(self.inference.last_generation_metrics())
             elif tool == "task_list":
                 docs = self.database.list_documents(keyword=arguments.get("keyword") or None, limit=min(int(arguments.get("limit", 10)), 20))
                 answer = self.inference.compose_answer("列出材料", docs, True, "list_documents")
+                timings.update(self.inference.last_generation_metrics())
             elif tool == "calendar_find_slots":
                 answer = "当前为本地沙箱模式，尚未连接真实日历。可先创建日程草稿，待授权接入后再查询真实空档。"
             elif tool == "email_create_draft":
@@ -231,9 +281,17 @@ class AgentOrchestrator:
             else:
                 raise PlanValidationError("UNKNOWN_TOOL", "未允许的工具")
             duration_ms = max(1, round((time.perf_counter() - started) * 1000))
-            self.database.finish_tool_attempt(attempt_id, "SUCCEEDED", {"summary": answer[:500], "citationIds": [item.get("chunkId") for item in citations]})
+            self.database.finish_tool_attempt(
+                attempt_id,
+                "SUCCEEDED",
+                {
+                    "resultSha256": hashlib.sha256(answer.encode("utf-8")).hexdigest(),
+                    "resultCharacters": len(answer),
+                    "citationIds": [item.get("chunkId") for item in citations],
+                },
+            )
             self.database.update_agent_plan_status(plan["id"], "SUCCEEDED", "SUCCEEDED", {"durationMs": duration_ms})
-            return answer, citations, duration_ms
+            return answer, citations, duration_ms, timings
         except Exception:
             self.database.finish_tool_attempt(attempt_id, "FAILED", {}, "TOOL_FAILED")
             self.database.update_agent_plan_status(plan["id"], "FAILED", "FAILED", {"errorCode": "TOOL_FAILED"})
@@ -284,4 +342,4 @@ class AgentOrchestrator:
     @staticmethod
     def _plan_event(plan: dict[str, Any]) -> dict[str, Any]:
         tool = TOOL_REGISTRY[plan["tool"]]
-        return {"planId": plan["id"], "action": tool.name, "legacyAction": tool.legacy_action, "label": tool.label, "riskClass": tool.risk_class, "status": plan["status"], "arguments": plan["arguments"], "expiresAt": plan.get("expiresAt"), "confirmationId": plan.get("confirmationId"), "confirmationNonce": plan.get("confirmationNonce")}
+        return {"planId": plan["id"], "action": tool.name, "legacyAction": tool.legacy_action, "label": tool.label, "riskClass": tool.risk_class, "status": plan["status"], "arguments": plan["arguments"], "expiresAt": plan.get("expiresAt")}

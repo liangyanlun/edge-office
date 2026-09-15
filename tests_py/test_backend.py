@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 from io import BytesIO
+import hashlib
+import json
 
 import pytest
 
@@ -10,6 +12,7 @@ from backend.agent import AgentOrchestrator, PlanValidationError, parse_action_p
 from backend.config import ROOT_DIR
 from backend.inference import InferenceAdapter
 from backend.parsers import ParseError, parse_upload
+from backend.rag import FaissRagService
 
 
 @pytest.fixture()
@@ -148,11 +151,121 @@ def test_rag_filters_before_scoring_rejects_low_confidence_and_audits(app, clien
     assert public["id"] != internal["id"]
 
 
+def test_rag_injects_at_most_four_blocks_within_frozen_budget(app):
+    rag = app.extensions["rag"]
+    evidence = rag.search("项目 目标 RAG 实施路线 性能", top_k=20)
+    assert len(evidence) <= 4
+    total = sum(
+        24 + rag._token_cost(item["fileName"]) + rag._token_cost(item["locator"])
+        + max(rag._token_cost(item["quote"]), rag._token_cost(item["context"]))
+        for item in evidence
+    )
+    assert total <= 900
+    assert rag.status()["retrieval"]["candidateK"] == 12
+    assert rag.status()["retrieval"]["rerankK"] == 5
+
+
+def test_rag_conflicting_cross_document_deadlines_fail_closed(app):
+    rag = app.extensions["rag"]
+    evidence = [
+        {"documentId": "a", "score": 0.91, "quote": "材料必须在周五提交。"},
+        {"documentId": "b", "score": 0.88, "quote": "材料必须在周一提交。"},
+    ]
+    assert rag._evidence_conflicts("材料什么时候提交？", evidence) is True
+    evidence[1]["documentId"] = "a"
+    assert rag._evidence_conflicts("材料什么时候提交？", evidence) is False
+
+
 def test_model_citation_validation_only_keeps_returned_evidence():
     evidence = [{"chunkId": "doc@v#chunk-1", "quote": "证据"}]
     answer = InferenceAdapter._ensure_citations("模型错误标注【9】。", evidence)
     assert "【9】" not in answer
     assert "【1】" in answer
+
+
+def test_model_citation_validation_normalizes_square_brackets():
+    evidence = [{"chunkId": "doc@v#chunk-1", "quote": "evidence"}]
+    answer = InferenceAdapter._ensure_citations("Model cites [1] and invalid [9].", evidence)
+    assert "【1】" in answer
+    assert "[1]" not in answer
+    assert "[9]" not in answer
+
+
+def test_llama_metrics_use_reported_completion_tokens_and_real_inference_time(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    class FakeModel:
+        def create_chat_completion(self, **_kwargs):
+            return {
+                "choices": [{"message": {"content": "测试回答"}}],
+                "usage": {"prompt_tokens": 40, "completion_tokens": 20},
+            }
+
+    adapter = InferenceAdapter(None, model_path=tmp_path / "fake.gguf")  # type: ignore[arg-type]
+    monkeypatch.setattr(adapter, "_get_model", lambda: FakeModel())
+    ticks = iter([10.0, 12.0])
+    monkeypatch.setattr("backend.inference.time.perf_counter", lambda: next(ticks))
+
+    assert adapter._chat("system", "user") == "测试回答"
+    assert adapter.last_generation_metrics() == {
+        "modelGenerationMs": 2000,
+        "promptTokens": 40,
+        "completionTokens": 20,
+        "tokensPerSecond": 10.0,
+        "failed": False,
+    }
+
+
+def test_stream_metrics_do_not_estimate_token_speed_from_character_count(client):
+    stream = client.post("/api/v1/chat/stream", json={"message": "项目的核心创新是什么？", "ragEnabled": True})
+    body = stream.data.decode("utf-8")
+    metrics_line = next(line for line in body.splitlines() if line.startswith("data: ") and '"responseLatencyMs"' in line)
+    metrics = json.loads(metrics_line.removeprefix("data: "))
+    assert metrics["responseLatencyMs"] >= 1
+    assert metrics["retrievalMs"] >= 1
+    assert metrics["tokensPerSecond"] is None
+    assert metrics["completionTokens"] is None
+
+
+def test_document_search_binds_the_original_user_question(app, monkeypatch: pytest.MonkeyPatch):
+    agent = app.extensions["agent"]
+    monkeypatch.setattr(
+        agent.inference,
+        "create_action_plan",
+        lambda *_: '{"tool":"document_search","arguments":{"query":"search-local-materials"},"confirmed":false}',
+    )
+    question = "What is the core innovation?"
+    plan = agent.plan(question, None, True, "trusted-query-test")
+    assert plan["tool"] == "document_search"
+    assert plan["arguments"]["query"] == question
+
+
+def test_rag_drops_low_relative_score_evidence():
+    reranked = [
+        (0.51, {"stable_id": "a"}, 0.0, 0.0),
+        (0.38, {"stable_id": "b"}, 0.0, 0.0),
+        (0.316, {"stable_id": "c"}, 0.0, 0.0),
+        (0.129, {"stable_id": "d"}, 0.0, 0.0),
+    ]
+    selected = FaissRagService._select_evidence_candidates(reranked, top_k=4)
+    assert [item[0] for item in selected] == [0.51, 0.38, 0.316]
+
+
+def test_release_manifest_binds_hash_quantization_context_and_acceptance(tmp_path: Path):
+    model = tmp_path / "Qwen3.5-0.8B.Q4_K_M.gguf"
+    model.write_bytes(b"safe-test-gguf")
+    manifest = tmp_path / "release.manifest.json"
+    manifest.write_text(json.dumps({
+        "schema": "edge_office_model_release_v1",
+        "model_file": model.name,
+        "sha256": hashlib.sha256(model.read_bytes()).hexdigest(),
+        "quantization": "Q4_K_M",
+        "context_length": 2048,
+        "acceptance_passed": True,
+    }), encoding="utf-8")
+    adapter = InferenceAdapter(None, model_path=model, release_manifest=manifest, n_ctx=2048)  # type: ignore[arg-type]
+    assert adapter._verify_release_manifest()["quantization"] == "Q4_K_M"
+    model.write_bytes(b"tampered")
+    with pytest.raises(RuntimeError, match="哈希"):
+        adapter._verify_release_manifest()
 
 
 def test_action_plan_rejects_invented_confirmation_unknown_fields_and_path_escape():
@@ -170,24 +283,33 @@ def test_high_risk_plan_requires_bound_single_use_confirmation_and_is_audited(cl
     plan = created.get_json()["item"]
     assert plan["tool"] == "email_send"
     assert plan["status"] == "AWAITING_CONFIRMATION"
-    assert plan["confirmationId"] and plan["confirmationNonce"]
+    assert "confirmationId" not in plan and "confirmationNonce" not in plan
+    untrusted = client.post(f"/api/v1/plans/{plan['id']}/confirm", json={"confirmed": True})
+    assert untrusted.status_code == 400
+    assert untrusted.get_json()["error"]["code"] == "UNTRUSTED_CONFIRMATION_PAYLOAD"
+    other_session = app.test_client().post(f"/api/v1/plans/{plan['id']}/confirm")
+    assert other_session.status_code == 409
+    assert other_session.get_json()["error"]["code"] == "CONFIRMATION_SESSION_MISMATCH"
 
     confirmed = client.post(
         f"/api/v1/plans/{plan['id']}/confirm",
-        json={"confirmationId": plan["confirmationId"], "confirmationNonce": plan["confirmationNonce"]},
     )
     assert confirmed.status_code == 200
     assert confirmed.get_json()["plan"]["status"] == "SUCCEEDED"
     assert "沙箱" in confirmed.get_json()["answer"]
     replay = client.post(
         f"/api/v1/plans/{plan['id']}/confirm",
-        json={"confirmationId": plan["confirmationId"], "confirmationNonce": plan["confirmationNonce"]},
     )
     assert replay.status_code == 409
 
     audit = client.get(f"/api/v1/audit/{plan['requestId']}").get_json()
     assert audit["plans"][0]["status"] == "SUCCEEDED"
     assert {event["type"] for event in audit["plans"][0]["events"]} >= {"PLANNED", "VALIDATED", "CONFIRMED", "EXECUTING", "SUCCEEDED"}
+    assert len(audit["plans"][0]["inputSha256"]) == 64
+    assert len(audit["plans"][0]["modelOutputSha256"]) == 64
+    assert audit["plans"][0]["toolAttempts"][0]["result"]["resultCharacters"] > 0
+    assert "summary" not in audit["plans"][0]["toolAttempts"][0]["result"]
+    assert audit["plans"][0]["confirmations"][0]["status"] == "CONSUMED"
 
 
 def test_expired_confirmation_fails_closed(client, app):
@@ -197,7 +319,6 @@ def test_expired_confirmation_fails_closed(client, app):
         connection.execute("UPDATE agent_plans SET expires_at = '2000-01-01T00:00:00+00:00' WHERE id = ?", (plan["id"],))
     response = client.post(
         f"/api/v1/plans/{plan['id']}/confirm",
-        json={"confirmationId": plan["confirmationId"], "confirmationNonce": plan["confirmationNonce"]},
     )
     assert response.status_code == 409
     assert app.extensions["database"].get_agent_plan(plan["id"])["status"] == "EXPIRED"
@@ -208,6 +329,8 @@ def test_trusted_intent_gate_never_broadens_a_small_model_tool_choice():
     assert AgentOrchestrator.candidate_tools("帮我发送一封邮件")[0]["name"] == "request_clarification"
     assert AgentOrchestrator.candidate_tools("删除待办 task-12")[0]["name"] == "task_delete"
     assert AgentOrchestrator.candidate_tools("引用项目目标原文")[0]["name"] == "document_quote"
+    draft_schema = AgentOrchestrator.candidate_tools("帮我写一封邮件草稿")[0]["schema"]
+    assert set(draft_schema) == {"to", "subject", "body", "tone"}
 
 
 def test_upload_import_parses_csv_html_and_preserves_source_locators(client, app):

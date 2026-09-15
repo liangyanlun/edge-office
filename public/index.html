@@ -58,7 +58,7 @@
             <div class="conversation-list" id="conversation-list" aria-live="polite"></div>
             <div class="demo-note">
               <strong>初步 Demo</strong>
-              <p>采用本地规则检索与 SSE 流式接口，后续可替换为真实轻量模型与 FAISS。</p>
+              <p>Flask 直连 llama.cpp，并以本地 FAISS + BM25 提供可追溯检索。</p>
             </div>
           </aside>
 
@@ -119,11 +119,12 @@
               <span>真实接口采样</span>
             </div>
             <div class="metric-grid" id="metric-grid">
-              <div class="metric"><span>TTFT</span><strong id="metric-ttft">—</strong></div>
-              <div class="metric"><span>检索</span><strong id="metric-retrieval">—</strong></div>
-              <div class="metric"><span>生成</span><strong id="metric-speed">—</strong></div>
-              <div class="metric"><span>RSS</span><strong id="metric-memory">—</strong></div>
+              <div class="metric" title="从提交问题到首段回答可发送"><span>首字响应</span><strong id="metric-ttft">—</strong></div>
+              <div class="metric" title="仅计算本地知识库搜索与重排"><span>检索耗时</span><strong id="metric-retrieval">—</strong></div>
+              <div class="metric" title="llama.cpp 实际输出 token 数除以模型推理耗时"><span>生成速度</span><strong id="metric-speed">—</strong></div>
+              <div class="metric" title="当前 Flask 进程工作集"><span>内存占用</span><strong id="metric-memory">—</strong></div>
             </div>
+            <p class="metric-footnote">生成速度采用 llama.cpp 的实际 completion_tokens / 推理耗时。</p>
           </aside>
         </section>
 

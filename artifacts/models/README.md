@@ -24,7 +24,7 @@ artifacts/models/
 若要启用本地 Embedding 模型，将完整路径设置为环境变量后启动服务：
 
 ```powershell
-$env:RAG_EMBEDDING_MODEL = "F:\大创前端代码\artifacts\models\embeddings\your-local-model"
+$env:RAG_EMBEDDING_MODEL = "artifacts\models\embeddings\your-local-model"
 .\.venv\Scripts\python.exe run_flask.py
 ```
 

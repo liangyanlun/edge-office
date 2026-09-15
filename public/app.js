@@ -13,6 +13,7 @@ const elements = {
   sidebarStatus: document.querySelector("#sidebar-service-status"),
   runtimeBadge: document.querySelector("#runtime-badge span:last-child"),
   messages: document.querySelector("#messages"),
+  chatPanel: document.querySelector(".chat-panel"),
   form: document.querySelector("#chat-form"),
   input: document.querySelector("#chat-input"),
   ragToggle: document.querySelector("#rag-toggle"),
@@ -141,10 +142,7 @@ function addPlanCard(plan, onCompleted) {
       confirm.disabled = cancel.disabled = true;
       status.textContent = "正在执行沙箱操作…";
       try {
-        const result = await request(`/api/v1/plans/${encodeURIComponent(plan.planId)}/confirm`, {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ confirmationId: plan.confirmationId, confirmationNonce: plan.confirmationNonce })
-        });
+        const result = await request(`/api/v1/plans/${encodeURIComponent(plan.planId)}/confirm`, { method: "POST" });
         status.textContent = result.plan?.status === "SUCCEEDED" ? "已完成" : (result.plan?.status || "已提交");
         actions.remove();
         onCompleted?.(result);
@@ -163,6 +161,9 @@ function addPlanCard(plan, onCompleted) {
 function updateEvidence(items) {
   state.citations = items;
   elements.evidenceCount.textContent = String(items.length);
+  elements.evidenceCount.classList.remove("counter-updated");
+  void elements.evidenceCount.offsetWidth;
+  elements.evidenceCount.classList.add("counter-updated");
   elements.evidence.replaceChildren();
   if (!items.length) {
     elements.evidence.className = "evidence-list empty-state";
@@ -173,6 +174,7 @@ function updateEvidence(items) {
   items.forEach((item, index) => {
     const card = document.createElement("article");
     card.className = "evidence-card";
+    card.style.setProperty("--item-index", index);
     card.dataset.evidenceIndex = String(index);
     const heading = document.createElement("header");
     const title = document.createElement("span");
@@ -197,11 +199,25 @@ function focusEvidence(index) {
   card.animate([{ outline: "3px solid rgba(42,98,221,.42)" }, { outline: "0 solid rgba(42,98,221,0)" }], { duration: 850 });
 }
 
+function formatDuration(value) {
+  const milliseconds = Number(value);
+  if (!Number.isFinite(milliseconds)) return "—";
+  return milliseconds < 1000 ? `${Math.round(milliseconds)} ms` : `${(milliseconds / 1000).toFixed(2)} s`;
+}
+
+function setMetric(element, value) {
+  element.textContent = value;
+  element.classList.remove("metric-updated");
+  void element.offsetWidth;
+  element.classList.add("metric-updated");
+}
+
 function updateMetrics(metrics) {
-  elements.ttft.textContent = `${metrics.ttftMs} ms`;
-  elements.retrieval.textContent = `${metrics.retrievalMs} ms`;
-  elements.speed.textContent = `${metrics.tokensPerSecond} tok/s`;
-  elements.memory.textContent = `${metrics.peakRssMb} MB`;
+  const responseLatency = metrics.responseLatencyMs ?? metrics.ttftMs;
+  setMetric(elements.ttft, formatDuration(responseLatency));
+  setMetric(elements.retrieval, metrics.retrievalMs == null ? (metrics.ragEnabled === false ? "未启用" : "—") : formatDuration(metrics.retrievalMs));
+  setMetric(elements.speed, Number.isFinite(Number(metrics.tokensPerSecond)) ? `${Number(metrics.tokensPerSecond).toFixed(1)} tok/s` : "—");
+  setMetric(elements.memory, Number.isFinite(Number(metrics.peakRssMb)) ? `${Number(metrics.peakRssMb).toFixed(1)} MB` : "—");
 }
 
 function resetMetrics() {
@@ -212,7 +228,8 @@ function setGenerating(isGenerating) {
   elements.send.disabled = isGenerating;
   elements.input.disabled = isGenerating;
   elements.stop.classList.toggle("hidden", !isGenerating);
-  elements.send.style.opacity = isGenerating ? ".58" : "1";
+  elements.chatPanel.classList.toggle("is-generating", isGenerating);
+  elements.chatPanel.setAttribute("aria-busy", String(isGenerating));
 }
 
 async function refreshRuntime() {
@@ -331,11 +348,15 @@ async function sendMessage(question) {
         }
         answer += data.text;
         renderTextWithCitations(assistant.body, answer);
+        assistant.body.classList.add("streaming");
         assistant.meta.textContent = "本地 Flask Agent · 流式输出";
         elements.messages.scrollTop = elements.messages.scrollHeight;
       }
       if (event === "metrics") updateMetrics(data);
-      if (event === "done") assistant.meta.textContent = "本地 Flask Agent · 已完成";
+      if (event === "done") {
+        assistant.body.classList.remove("streaming");
+        assistant.meta.textContent = "本地 Flask Agent · 已完成";
+      }
       if (event === "error") throw new Error(data.message || "生成失败");
     };
     while (true) {
@@ -353,6 +374,7 @@ async function sendMessage(question) {
       showToast("已停止本轮生成");
     } else {
       assistant.body.classList.remove("typing");
+      assistant.body.classList.remove("streaming");
       assistant.body.textContent = `发生错误：${error.message}`;
       assistant.meta.textContent = "生成失败";
       showToast(error.message);
@@ -368,9 +390,10 @@ async function refreshDocuments() {
   const imported = payload.items.filter((item) => !item.builtin).length;
   elements.knowledgeSummary.innerHTML = `<span class="summary-chip">${payload.items.length} 份材料</span><span class="summary-chip">${imported} 份用户导入</span><span class="summary-chip">下一轮问答即时生效</span>`;
   elements.documentList.replaceChildren();
-  payload.items.forEach((document) => {
+  payload.items.forEach((document, index) => {
     const card = document.createElement("article");
     card.className = "document-card";
+    card.style.setProperty("--item-index", index);
     const main = document.createElement("div");
     main.className = "document-main";
     const icon = document.createElement("div");

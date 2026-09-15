@@ -20,9 +20,10 @@ def default_config() -> dict[str, object]:
         # It is downloaded once into artifacts/models and always loaded locally.
         "EMBEDDING_MODEL_PATH": os.getenv("RAG_EMBEDDING_MODEL", str(default_embedding_model)),
         "RAG_QUERY_INSTRUCTION": os.getenv("RAG_QUERY_INSTRUCTION", "为这个句子生成表示以用于检索相关文章："),
-        "RAG_TOP_K": int(os.getenv("RAG_TOP_K", "2")),
+        "RAG_TOP_K": int(os.getenv("RAG_TOP_K", "4")),
         "RAG_CANDIDATE_K": int(os.getenv("RAG_CANDIDATE_K", "12")),
         "RAG_RERANK_K": int(os.getenv("RAG_RERANK_K", "5")),
+        "RAG_EVIDENCE_TOKEN_BUDGET": int(os.getenv("RAG_EVIDENCE_TOKEN_BUDGET", "900")),
         "RAG_MIN_CONFIDENCE": float(os.getenv("RAG_MIN_CONFIDENCE", "0.42")),
         "RAG_ALLOWED_SECURITY_LEVELS": tuple(
             level.strip() for level in os.getenv("RAG_ALLOWED_SECURITY_LEVELS", "public,internal").split(",") if level.strip()
@@ -32,8 +33,13 @@ def default_config() -> dict[str, object]:
         "LLAMA_CPP_ENABLED": os.getenv("LLAMA_CPP_ENABLED", "true").lower() in {"1", "true", "yes"},
         "LLAMA_MODEL_PATH": os.getenv(
             "LLAMA_MODEL_PATH",
-            str(artifacts / "models" / "qwen3_0p8_gguf" / "Qwen3.5-0.8B.q3_k_l.gguf"),
+            str(artifacts / "models" / "qwen3_0p8_gguf" / "Qwen3.5-0.8B.Q4_K_M.gguf"),
         ),
+        "LLAMA_RELEASE_MANIFEST": os.getenv(
+            "LLAMA_RELEASE_MANIFEST",
+            str(artifacts / "models" / "qwen3_0p8_gguf" / "release.manifest.json"),
+        ),
+        "LLAMA_RELEASE_REQUIRED": os.getenv("LLAMA_RELEASE_REQUIRED", "true").lower() in {"1", "true", "yes"},
         "LLAMA_N_CTX": int(os.getenv("LLAMA_N_CTX", "2048")),
         "LLAMA_N_THREADS": int(os.getenv("LLAMA_N_THREADS", str(max(1, (os.cpu_count() or 2) // 2)))),
         "LLAMA_N_GPU_LAYERS": int(os.getenv("LLAMA_N_GPU_LAYERS", "0")),

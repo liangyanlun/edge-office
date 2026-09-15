@@ -59,23 +59,25 @@ npm test
 
 ## 模型与 RAG
 
-- 模型包放在 [artifacts/models/README.md](</F:/大创前端代码/artifacts/models/README.md:1>) 定义的位置，绝不放到 `public/`；
+- 模型包放在 [artifacts/models/README.md](artifacts/models/README.md) 定义的位置，绝不放到 `public/`；
 - 默认 RAG 嵌入模型为本地 `artifacts/models/bge-small-zh-v1.5`。它使用 `BAAI/bge-small-zh-v1.5` 的中文检索指令，生成 512 维归一化向量；模型卡说明它适用于中文检索，权重约 96MB。[模型卡](https://huggingface.co/BAAI/bge-small-zh-v1.5)
 - 若克隆项目后缺少该模型，联网执行 `python scripts/download_rag_model.py` 下载一次；运行时不会联网下载，缺失时会明确降级到哈希向量，仅用于演示。
 - RAG 先以 FAISS 与 BM25 各自召回候选，再结合句子级词项覆盖度重排序；最终只将 1～2 条紧凑证据输入 0.8B 模型，减少上下文和幻觉风险。
 - 设置 `RAG_EMBEDDING_MODEL` 可替换本地 SentenceTransformer 路径；`RAG_QUERY_INSTRUCTION`、`RAG_TOP_K` 和 `RAG_CANDIDATE_K` 可用于研究对比实验。
-- `RAG_RERANK_K`（默认 5）控制重排序候选证据数，`RAG_MIN_CONFIDENCE`（默认 0.42）控制拒答阈值，`RAG_ALLOWED_SECURITY_LEVELS`（默认 `public,internal`）控制本地会话允许检索的材料级别。
+- `RAG_RERANK_K`（默认 5）控制重排序候选证据数，最终最多注入 4 个证据块；`RAG_EVIDENCE_TOKEN_BUDGET`（默认 900）对注入上下文执行保守 token 预算。`RAG_MIN_CONFIDENCE`（默认 0.42）控制拒答阈值，`RAG_ALLOWED_SECURITY_LEVELS`（默认 `public,internal`）控制本地会话允许检索的材料级别。
 - 浏览器通过 `POST /api/v1/documents/import` 上传本地 TXT、Markdown、PDF、DOCX、XLSX、CSV、PPTX 或 HTML。后端按扩展名白名单解析、限制 20MB 原始文件与 20 万字符解析文本，并记录原始文件 SHA256、MIME 类型、解析器版本、抽取质量和结构统计；不会接受宏格式、任意压缩包或可执行内容。
 - 扫描 PDF 使用内置 RapidOCR + ONNX Runtime 离线识别，只处理没有原生文本的页面；默认最多 30 个 OCR 页面。低置信度结果会在知识库页面标记“需复核”，任一扫描页完全无法识别时整份文件拒绝导入，不会污染已有索引。
 - XLSX 默认限制 30 个工作表、每表 5000 行、100 列；PPTX 默认限制 300 页。Office 文件在解析前检查内部路径、文件数、展开体积和异常压缩比例。
 - 可用 `OCR_ENABLED=false` 关闭 OCR；`MAX_OCR_PAGES`、`MAX_XLSX_ROWS_PER_SHEET`、`MAX_XLSX_COLUMNS` 和 `MAX_PPTX_SLIDES` 可调整资源上限。纯图片 PPT 页面暂不做 OCR，真实用户权限和原文件留存策略仍待完善。
 - 默认生成模型为 `artifacts/models/qwen3_0p8_gguf/Qwen3.5-0.8B.q3_k_l.gguf`；Flask 会通过 `llama-cpp-python` 在本进程中加载它，并将 FAISS 检索证据直接传入模型生成回答；
-- 可通过 `LLAMA_MODEL_PATH` 切换 GGUF，通过 `LLAMA_N_CTX`、`LLAMA_N_THREADS` 和 `LLAMA_N_GPU_LAYERS` 调整上下文、CPU 线程和 GPU 卸载层数；设置 `LLAMA_CPP_ENABLED=false` 可关闭真实推理并使用安全兜底；
+- 正式运行默认加载 `Qwen3.5-0.8B.Q4_K_M.gguf`，固定 `LLAMA_N_CTX=2048`。`LLAMA_RELEASE_MANIFEST` 必须绑定模型 SHA256、Q4_K_M/Q8_0/F16 格式和已通过的验收；只有显式设置 `LLAMA_RELEASE_REQUIRED=false` 才允许开发环境绕过。可通过 `LLAMA_N_THREADS` 和 `LLAMA_N_GPU_LAYERS` 调整 CPU 线程和 GPU 卸载层数；设置 `LLAMA_CPP_ENABLED=false` 可关闭真实推理并使用安全兜底；
 - Agent 每轮只规划一个固定动作。模型输出受到 llama.cpp JSON Grammar 约束，并会被服务端以严格 JSON、字段、类型、大小、路径和权限策略再次校验；模型写出的 `confirmed:true` 一律拒绝。
-- 高风险动作（发送邮件、提交日程、删除待办、覆盖文件）必须由用户在计划卡中显式确认。确认绑定用户、计划哈希、策略版本、过期时间与一次性 nonce；参数变化、过期或重放都会失效。
+- 高风险动作（发送邮件、提交日程、删除待办、覆盖文件）必须由用户在计划卡中显式确认。确认绑定本地浏览器会话、计划哈希、策略版本、过期时间与一次性 nonce；nonce 只保存在 Flask 进程内，不下发浏览器，参数变化、进程重启、过期或重放都会失效。
 - 可通过 `GET /api/v1/agent/tools` 查看固定动作表；新计划 API 为 `POST /api/v1/plans`、`GET /api/v1/plans/{id}`、`POST /api/v1/plans/{id}/confirm`、`POST /api/v1/plans/{id}/cancel` 与 `GET /api/v1/audit/{requestId}`。
+- 审计接口返回输入/模型输出哈希、模型与策略版本、规范化计划、检索索引与证据 ID、确认生命周期、幂等工具尝试、脱敏结果和耗时；不返回 nonce、邮件正文或文档正文。
+- 正式 RAG 验收还需在本机准备至少 100 条人工审核问题；每条必须记录真实 `document_id/version_id/chunk_id`（无证据题必须为空），并按文档版本设置隔离组。运行 `python scripts/validate_local_rag_eval.py --input <本地评测.jsonl> --output <不可覆盖验证报告.json>`；该文件包含用户本地知识，只留在本机，不同步到训练服务器。
 - 当前不暴露 Shell、任意 Python、任意 URL、任意 SQL 或真实外部发送；高风险动作只进行本地沙箱演练，后续接入真实服务仍需单独授权与连接器审查。
-- 运行 `python scripts/evaluate_agent_plans.py --model <GGUF路径> --output <报告路径>` 可复现本地 ActionPlan 基线评测；当前基线结论见 [Agent评测报告](</F:/大创前端代码/Agent评测报告.md:1>)，尚未达到正式模型验收门槛。
+- 运行 `python scripts/evaluate_agent_plans.py --model <GGUF路径> --output <报告路径>` 可复现本地 ActionPlan 基线评测；当前基线结论见 [Agent评测报告](Agent评测报告.md)，尚未达到正式模型验收门槛。
 
 ## 旧版 Node 回退
 
@@ -83,4 +85,4 @@ npm test
 npm run start:node
 ```
 
-接口事件、页面信息架构与指标字段已按 [前后端开发详细方案](</F:/大创前端代码/前后端开发详细方案.md:1>) 的方向设计，因此后续替换实现时不需要重做页面流程。
+接口事件、页面信息架构与指标字段已按 [前后端开发详细方案](前后端开发详细方案.md) 的方向设计，因此后续替换实现时不需要重做页面流程。

@@ -22,6 +22,7 @@ from .database import Database
 
 DEFAULT_QUERY_INSTRUCTION = "为这个句子生成表示以用于检索相关文章："
 _VECTOR_MASK = (1 << 63) - 1
+_EVIDENCE_RELATIVE_FLOOR = 0.55
 
 
 def _sha256_text(value: str) -> str:
@@ -222,6 +223,7 @@ class FaissRagService:
         query_instruction: str = DEFAULT_QUERY_INSTRUCTION,
         candidate_k: int = 12,
         rerank_k: int = 5,
+        evidence_token_budget: int = 900,
         min_confidence: float = 0.42,
         allowed_security_levels: tuple[str, ...] = ("public", "internal"),
     ):
@@ -234,6 +236,7 @@ class FaissRagService:
         self.embedder = EmbeddingProvider(embedding_model_path, query_instruction)
         self.candidate_k = max(4, candidate_k)
         self.rerank_k = max(1, min(6, rerank_k))
+        self.evidence_token_budget = max(128, min(1800, int(evidence_token_budget)))
         self.min_confidence = max(0.0, min(0.99, min_confidence))
         self.allowed_security_levels = frozenset(allowed_security_levels)
         self.index: faiss.IndexIDMap2 | None = None
@@ -365,8 +368,23 @@ class FaissRagService:
         if not reranked or reranked[0][0] < threshold:
             return self._finish_search(request_id, query, generation, document_ids, [], "insufficient_confidence", began, levels)
 
-        evidence = [self._evidence(query, record, final_score, dense_score, lexical_score, chunks_by_document) for final_score, record, dense_score, lexical_score in reranked[:top_k]]
+        selected = self._select_evidence_candidates(reranked, top_k)
+        evidence = [self._evidence(query, record, final_score, dense_score, lexical_score, chunks_by_document) for final_score, record, dense_score, lexical_score in selected]
+        evidence = self._compact_evidence(evidence, self.evidence_token_budget)
+        if self._evidence_conflicts(query, evidence):
+            return self._finish_search(request_id, query, generation, document_ids, [], "conflicting_evidence", began, levels)
         return self._finish_search(request_id, query, generation, document_ids, evidence, "ok", began, levels)
+
+    @staticmethod
+    def _select_evidence_candidates(
+        reranked: list[tuple[float, dict[str, Any], float, float]], top_k: int,
+    ) -> list[tuple[float, dict[str, Any], float, float]]:
+        """Avoid spending the evidence budget on results far below the best hit."""
+        candidates = reranked[:top_k]
+        if not candidates:
+            return []
+        floor = candidates[0][0] * _EVIDENCE_RELATIVE_FLOOR
+        return [item for item in candidates if item[0] >= floor]
 
     def status(self) -> dict[str, Any]:
         with self._state_lock:
@@ -379,6 +397,7 @@ class FaissRagService:
                 "retrieval": {
                     "dense": "FAISS IndexFlatIP", "lexical": "BM25", "reranker": "hybrid-score + sentence-overlap",
                     "candidateK": self.candidate_k, "rerankK": self.rerank_k, "minimumConfidence": self.min_confidence,
+                    "maxInjectedEvidence": 4, "evidenceTokenBudget": self.evidence_token_budget,
                     "allowedSecurityLevels": sorted(self.allowed_security_levels),
                 },
             }
@@ -456,6 +475,63 @@ class FaissRagService:
         if position < 0 or position + 1 >= len(siblings):
             return context
         return f"{context}\n{str(siblings[position + 1]['content'])[:maximum_characters - len(context)]}".strip()
+
+    @staticmethod
+    def _token_cost(text: str) -> int:
+        """Conservative tokenizer-free budget for Chinese/English evidence."""
+        cjk = len(re.findall(r"[\u3400-\u9fff]", text))
+        non_cjk = re.sub(r"[\u3400-\u9fff]", " ", text)
+        return cjk + len(re.findall(r"[A-Za-z0-9_]+|[^\sA-Za-z0-9_]", non_cjk))
+
+    @classmethod
+    def _trim_tokens(cls, text: str, budget: int) -> str:
+        if budget <= 0:
+            return ""
+        output: list[str] = []
+        for character in text:
+            candidate = "".join(output) + character
+            if cls._token_cost(candidate) > budget:
+                break
+            output.append(character)
+        return "".join(output).rstrip()
+
+    @classmethod
+    def _compact_evidence(cls, evidence: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
+        compacted: list[dict[str, Any]] = []
+        remaining = budget
+        for item in evidence[:4]:
+            metadata_cost = 24 + cls._token_cost(str(item.get("fileName", ""))) + cls._token_cost(str(item.get("locator", "")))
+            if remaining <= metadata_cost + 8:
+                break
+            available = remaining - metadata_cost
+            quote = cls._trim_tokens(str(item.get("quote", "")), min(260, available))
+            if not quote:
+                break
+            quote_cost = cls._token_cost(quote)
+            context_budget = max(0, available - quote_cost)
+            context = cls._trim_tokens(str(item.get("context", quote)), context_budget) or quote
+            compact = {**item, "quote": quote, "context": context, "quoteSha256": _sha256_text(quote)}
+            compacted.append(compact)
+            remaining -= metadata_cost + max(quote_cost, cls._token_cost(context))
+        return compacted
+
+    @staticmethod
+    def _evidence_conflicts(query: str, evidence: list[dict[str, Any]]) -> bool:
+        """Fail closed on close-scored, cross-document deadline or policy conflicts."""
+        if len(evidence) < 2 or abs(float(evidence[0]["score"]) - float(evidence[1]["score"])) > 0.08:
+            return False
+        left, right = evidence[0], evidence[1]
+        if left.get("documentId") == right.get("documentId"):
+            return False
+        left_text, right_text = str(left.get("quote", "")), str(right.get("quote", ""))
+        if re.search(r"何时|什么时候|截止|日期|时间|多少|金额|数量", query):
+            marker = r"\d{1,4}(?:[-/.年]\d{1,2})?(?:[-/.月]\d{1,2}日?)?|周[一二三四五六日天]|星期[一二三四五六日天]"
+            left_facts, right_facts = set(re.findall(marker, left_text)), set(re.findall(marker, right_text))
+            if left_facts and right_facts and left_facts.isdisjoint(right_facts):
+                return True
+        negative = re.compile(r"无需|不需要|不得|禁止|不可|不能")
+        positive = re.compile(r"需要|必须|应当|可以|允许")
+        return bool((negative.search(left_text) and positive.search(right_text)) or (positive.search(left_text) and negative.search(right_text)))
 
     def _manifest_for(self, documents: list[dict[str, Any] | None], chunks: list[dict[str, Any]], dimension: int) -> dict[str, Any]:
         documents = [item for item in documents if item]

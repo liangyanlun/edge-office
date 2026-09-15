@@ -4,12 +4,14 @@ import ctypes
 import hashlib
 import json
 import os
+import re
+import secrets
 import time
 from pathlib import Path
 from typing import Any, Generator
 from uuid import uuid4
 
-from flask import Flask, Response, jsonify, request, send_from_directory, stream_with_context
+from flask import Flask, Response, g, jsonify, request, send_from_directory, stream_with_context
 
 from .agent import AgentOrchestrator, PlanValidationError
 from .config import default_config
@@ -40,7 +42,13 @@ def process_memory_mb() -> float:
 
         counters = PROCESS_MEMORY_COUNTERS_EX()
         counters.cb = ctypes.sizeof(counters)
-        ok = ctypes.windll.psapi.GetProcessMemoryInfo(ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        get_process_memory_info = psapi.GetProcessMemoryInfo
+        get_process_memory_info.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESS_MEMORY_COUNTERS_EX), ctypes.c_ulong]
+        get_process_memory_info.restype = ctypes.c_int
+        ok = get_process_memory_info(kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb)
         return round(counters.WorkingSetSize / 1024 / 1024, 1) if ok else 0.0
     except Exception:
         return 0.0
@@ -64,6 +72,7 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
         query_instruction=str(app.config["RAG_QUERY_INSTRUCTION"]),
         candidate_k=int(app.config["RAG_CANDIDATE_K"]),
         rerank_k=int(app.config["RAG_RERANK_K"]),
+        evidence_token_budget=int(app.config["RAG_EVIDENCE_TOKEN_BUDGET"]),
         min_confidence=float(app.config["RAG_MIN_CONFIDENCE"]),
         allowed_security_levels=tuple(app.config["RAG_ALLOWED_SECURITY_LEVELS"]),
     )
@@ -76,6 +85,8 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
         n_ctx=int(app.config["LLAMA_N_CTX"]),
         n_threads=int(app.config["LLAMA_N_THREADS"]),
         n_gpu_layers=int(app.config["LLAMA_N_GPU_LAYERS"]),
+        release_manifest=Path(str(app.config["LLAMA_RELEASE_MANIFEST"])),
+        release_required=bool(app.config["LLAMA_RELEASE_REQUIRED"]),
     )
 
     def runtime_status() -> dict[str, Any]:
@@ -99,7 +110,26 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
     app.extensions["database"] = database
     app.extensions["rag"] = rag
     app.extensions["agent"] = agent
+    app.extensions["inference"] = inference
     app.extensions["runtime_status"] = runtime_status
+
+    @app.before_request
+    def bind_local_session() -> None:
+        token = request.cookies.get("edge_office_session", "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token):
+            token = secrets.token_urlsafe(32)
+            g.set_local_session_cookie = True
+            g.local_session_token = token
+        g.local_session_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    @app.after_request
+    def persist_local_session(response: Response) -> Response:
+        if getattr(g, "set_local_session_cookie", False):
+            response.set_cookie(
+                "edge_office_session", g.local_session_token,
+                max_age=24 * 60 * 60, httponly=True, samesite="Strict", secure=False,
+            )
+        return response
 
     @app.get("/")
     def home() -> Response:
@@ -199,7 +229,7 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
         conversation_id = str(payload.get("conversationId") or "") or None
         if conversation_id and not database.get_conversation(conversation_id):
             return error("CONVERSATION_NOT_FOUND", "会话不存在", 404)
-        plan = agent.plan(message, conversation_id, payload.get("ragEnabled") is not False, str(uuid4()))
+        plan = agent.plan(message, conversation_id, payload.get("ragEnabled") is not False, str(uuid4()), session_id=g.local_session_id)
         return jsonify({"item": plan}), 201
 
     @app.get("/api/v1/plans/<plan_id>")
@@ -209,13 +239,11 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
 
     @app.post("/api/v1/plans/<plan_id>/confirm")
     def confirm_plan(plan_id: str) -> Response:
-        payload = request.get_json(silent=True) or {}
-        confirmation_id = str(payload.get("confirmationId") or "")
-        nonce = str(payload.get("confirmationNonce") or "")
-        if not confirmation_id or not nonce:
-            return error("CONFIRMATION_REQUIRED", "缺少确认凭据", 400)
+        payload = request.get_json(silent=True)
+        if payload not in (None, {}):
+            return error("UNTRUSTED_CONFIRMATION_PAYLOAD", "确认请求只能由计划 ID 触发", 400)
         try:
-            result = agent.confirm(plan_id, confirmation_id, nonce)
+            result = agent.confirm(plan_id, session_id=g.local_session_id)
             return jsonify(result)
         except PlanValidationError as exc:
             return error(exc.code, str(exc), 409 if exc.code.startswith("CONFIRMATION_") else 400)
@@ -223,7 +251,7 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
     @app.post("/api/v1/plans/<plan_id>/cancel")
     def cancel_plan(plan_id: str) -> Response:
         try:
-            return jsonify({"item": agent.cancel(plan_id)})
+            return jsonify({"item": agent.cancel(plan_id, session_id=g.local_session_id)})
         except PlanValidationError as exc:
             return error(exc.code, str(exc), 404 if exc.code == "PLAN_NOT_FOUND" else 409)
 
@@ -244,8 +272,9 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
             return error("CONVERSATION_NOT_FOUND", "会话不存在", 404)
         database.add_message(conversation_id, "user", message)
         request_id = str(uuid4())
-        answer, citations, info, _ = agent.execute(message, conversation_id, payload.get("ragEnabled") is not False, request_id=request_id)
-        database.add_message(conversation_id, "assistant", answer, citations, {"agentAction": info["action"], "retrievalMs": info["durationMs"]})
+        answer, citations, info, _ = agent.execute(message, conversation_id, payload.get("ragEnabled") is not False, request_id=request_id, session_id=g.local_session_id)
+        timings = info.get("timings", {})
+        database.add_message(conversation_id, "assistant", answer, citations, {"agentAction": info["action"], **timings})
         return jsonify({"conversationId": conversation_id, "answer": answer, "citations": citations, "run": info})
 
     @app.post("/api/v1/chat/stream")
@@ -275,7 +304,7 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
             })
             yield sse("stage", {"name": "agent", "label": "正在规划本地办公任务"})
             try:
-                answer, citations, run, agent_events = agent.execute(message, conversation_id, rag_enabled, request_id=request_id)
+                answer, citations, run, agent_events = agent.execute(message, conversation_id, rag_enabled, request_id=request_id, session_id=g.local_session_id)
                 for item in agent_events:
                     yield sse(item["event"], item["data"])
                 if citations:
@@ -287,11 +316,24 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
                     token = answer[index:index + 12]
                     emitted += token
                     yield sse("token", {"text": token})
-                generation_ms = max(1, round((time.perf_counter() - first_token_at) * 1000))
-                metrics = {"ttftMs": round((first_token_at - began) * 1000), "retrievalMs": run["durationMs"], "generationMs": generation_ms, "tokensPerSecond": round(max(1, len(emitted) / 1.8) / generation_ms * 1000, 1), "peakRssMb": process_memory_mb(), "agentAction": run["action"]}
+                timings = run.get("timings", {})
+                response_latency_ms = max(1, round((first_token_at - began) * 1000))
+                metrics = {
+                    "responseLatencyMs": response_latency_ms,
+                    "ttftMs": response_latency_ms,
+                    "planningMs": timings.get("planningMs"),
+                    "retrievalMs": timings.get("retrievalMs"),
+                    "generationMs": timings.get("modelGenerationMs"),
+                    "tokensPerSecond": timings.get("tokensPerSecond"),
+                    "promptTokens": timings.get("promptTokens"),
+                    "completionTokens": timings.get("completionTokens"),
+                    "peakRssMb": process_memory_mb(),
+                    "agentAction": run["action"],
+                    "ragEnabled": rag_enabled,
+                }
                 database.add_message(conversation_id, "assistant", emitted, citations, metrics)
                 yield sse("metrics", metrics)
-                yield sse("done", {"finishReason": "stop", "usage": {"inputTokens": max(1, len(message) // 2), "outputTokens": max(1, len(emitted) // 2)}})
+                yield sse("done", {"finishReason": "stop", "usage": {"inputTokens": timings.get("promptTokens"), "outputTokens": timings.get("completionTokens")}})
             except Exception as exc:
                 yield sse("error", {"code": "AGENT_ERROR", "message": str(exc) or "Agent 执行失败"})
 

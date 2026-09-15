@@ -118,6 +118,7 @@ class Database:
                   policy_version TEXT NOT NULL,
                   model_name TEXT NOT NULL,
                   model_output_sha256 TEXT,
+                  request_input_sha256 TEXT,
                   status TEXT NOT NULL,
                   expires_at TEXT,
                   created_at TEXT NOT NULL,
@@ -179,6 +180,7 @@ class Database:
                 "stable_id": "TEXT", "version_id": "TEXT", "content_sha256": "TEXT", "vector_id": "INTEGER",
                 "security_level": "TEXT NOT NULL DEFAULT 'internal'",
             },
+            "agent_plans": {"request_input_sha256": "TEXT"},
         }
         for table, columns in expected.items():
             existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
@@ -379,6 +381,7 @@ class Database:
         policy_version: str,
         model_name: str,
         model_output_sha256: str | None,
+        request_input_sha256: str,
         status: str,
         expires_in_seconds: int | None = None,
     ) -> dict[str, Any]:
@@ -389,17 +392,18 @@ class Database:
             "tool": tool, "arguments_json": json.dumps(arguments, ensure_ascii=False, sort_keys=True),
             "canonical_json": canonical_json, "plan_sha256": plan_sha256, "risk_class": risk_class,
             "policy_version": policy_version, "model_name": model_name, "model_output_sha256": model_output_sha256,
+            "request_input_sha256": request_input_sha256,
             "status": status, "expires_at": expires_at, "created_at": created_at, "updated_at": created_at,
         }
         with self.connect() as connection:
             connection.execute(
                 """INSERT INTO agent_plans(id, request_id, conversation_id, tool, arguments_json, canonical_json,
-                   plan_sha256, risk_class, policy_version, model_name, model_output_sha256, status, expires_at, created_at, updated_at)
+                   plan_sha256, risk_class, policy_version, model_name, model_output_sha256, request_input_sha256, status, expires_at, created_at, updated_at)
                    VALUES(:id, :request_id, :conversation_id, :tool, :arguments_json, :canonical_json, :plan_sha256,
-                   :risk_class, :policy_version, :model_name, :model_output_sha256, :status, :expires_at, :created_at, :updated_at)""",
+                   :risk_class, :policy_version, :model_name, :model_output_sha256, :request_input_sha256, :status, :expires_at, :created_at, :updated_at)""",
                 plan,
             )
-            self._add_plan_event(connection, plan["id"], "RECEIVED", {"status": status})
+            self._add_plan_event(connection, plan["id"], "RECEIVED", {"status": status, "inputSha256": request_input_sha256})
             self._add_plan_event(connection, plan["id"], "PLANNED", {"tool": tool, "riskClass": risk_class})
             self._add_plan_event(connection, plan["id"], "VALIDATED", {"policyVersion": policy_version})
         return self.get_agent_plan(plan["id"]) or {}
@@ -486,10 +490,11 @@ class Database:
         return attempt_id
 
     def finish_tool_attempt(self, attempt_id: str, status: str, result: dict[str, Any], error_code: str | None = None) -> None:
+        safe_result = self._redact_for_audit(result)
         with self.connect() as connection:
             connection.execute(
                 "UPDATE agent_tool_attempts SET status = ?, result_json = ?, error_code = ?, completed_at = ? WHERE id = ?",
-                (status, json.dumps(result, ensure_ascii=False, sort_keys=True), error_code, now_iso(), attempt_id),
+                (status, json.dumps(safe_result, ensure_ascii=False, sort_keys=True), error_code, now_iso(), attempt_id),
             )
 
     def audit_for_request(self, request_id: str) -> dict[str, Any]:
@@ -505,12 +510,44 @@ class Database:
                 ).fetchall()
                 for plan in plans
             }
+            attempts_by_plan = {
+                plan["id"]: connection.execute(
+                    "SELECT id, idempotency_key, status, result_json, error_code, started_at, completed_at FROM agent_tool_attempts WHERE plan_id = ? ORDER BY started_at",
+                    (plan["id"],),
+                ).fetchall()
+                for plan in plans
+            }
+            confirmations_by_plan = {
+                plan["id"]: connection.execute(
+                    "SELECT id, plan_sha256, user_id, expires_at, status, consumed_at, created_at FROM agent_confirmations WHERE plan_id = ? ORDER BY created_at",
+                    (plan["id"],),
+                ).fetchall()
+                for plan in plans
+            }
         audit_plans = []
         for plan in plans:
             item = self._agent_plan(plan, events_by_plan[plan["id"]])
             item["arguments"] = self._redact_for_audit(item["arguments"])
+            item["events"] = self._redact_for_audit(item["events"])
+            item["toolAttempts"] = [
+                {
+                    "id": attempt["id"], "idempotencyKey": attempt["idempotency_key"], "status": attempt["status"],
+                    "result": self._redact_for_audit(json.loads(attempt["result_json"])), "errorCode": attempt["error_code"],
+                    "startedAt": attempt["started_at"], "completedAt": attempt["completed_at"],
+                }
+                for attempt in attempts_by_plan[plan["id"]]
+            ]
+            item["confirmations"] = [dict(confirmation) for confirmation in confirmations_by_plan[plan["id"]]]
             audit_plans.append(item)
-        return {"requestId": request_id, "plans": audit_plans, "retrieval": [dict(row) for row in retrievals]}
+        audit_retrieval = [
+            {
+                "indexGeneration": row["index_generation"], "filters": json.loads(row["filters_json"]),
+                "evidence": json.loads(row["evidence_json"]), "status": row["status"],
+                "durationMs": row["duration_ms"], "createdAt": row["created_at"],
+            }
+            for row in retrievals
+        ]
+        return {"requestId": request_id, "plans": audit_plans, "retrieval": audit_retrieval}
 
     @staticmethod
     def _redact_for_audit(value: Any) -> Any:
@@ -527,6 +564,7 @@ class Database:
             "id": plan["id"], "requestId": plan["request_id"], "conversationId": plan["conversation_id"],
             "tool": plan["tool"], "arguments": json.loads(plan["arguments_json"]), "planHash": plan["plan_sha256"],
             "riskClass": plan["risk_class"], "policyVersion": plan["policy_version"], "model": plan["model_name"],
+            "inputSha256": plan.get("request_input_sha256"), "modelOutputSha256": plan.get("model_output_sha256"),
             "status": plan["status"], "expiresAt": plan["expires_at"], "createdAt": plan["created_at"],
             "updatedAt": plan["updated_at"],
             "events": [{"type": item["event_type"], "detail": json.loads(item["detail_json"]), "createdAt": item["created_at"]} for item in events],
