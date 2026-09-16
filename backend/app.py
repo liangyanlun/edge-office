@@ -17,6 +17,7 @@ from .agent import AgentOrchestrator, PlanValidationError
 from .config import default_config
 from .database import Database
 from .inference import InferenceAdapter, LocalModelRegistry
+from .model_download import ModelDownloadError, ModelReleaseDownloader
 from .parsers import ParseError, parse_upload
 from .rag import FaissRagService
 
@@ -86,12 +87,29 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
         n_threads=int(app.config["LLAMA_N_THREADS"]),
         n_gpu_layers=int(app.config["LLAMA_N_GPU_LAYERS"]),
         release_manifest=Path(str(app.config["LLAMA_RELEASE_MANIFEST"])),
+        release_checksum=Path(str(app.config["LLAMA_RELEASE_CHECKSUM"])),
         release_required=bool(app.config["LLAMA_RELEASE_REQUIRED"]),
+    )
+    model_downloader = ModelReleaseDownloader(
+        enabled=bool(app.config["MODEL_RELEASE_DOWNLOAD_ENABLED"]),
+        repository=str(app.config["MODEL_RELEASE_REPOSITORY"]),
+        release_tag=str(app.config["MODEL_RELEASE_TAG"]),
+        models_dir=Path(str(app.config["MODELS_DIR"])),
+        model_path=Path(str(app.config["LLAMA_MODEL_PATH"])),
+        manifest_path=Path(str(app.config["LLAMA_RELEASE_MANIFEST"])),
+        checksum_path=Path(str(app.config["LLAMA_RELEASE_CHECKSUM"])),
+        n_ctx=int(app.config["LLAMA_N_CTX"]),
+        release_required=bool(app.config["LLAMA_RELEASE_REQUIRED"]),
+        timeout_seconds=int(app.config["MODEL_DOWNLOAD_TIMEOUT_SECONDS"]),
+        max_bytes=int(app.config["MODEL_DOWNLOAD_MAX_BYTES"]),
+        on_installed=inference.refresh_model_file_state,
+        can_replace=inference.can_replace_model_file,
     )
 
     def runtime_status() -> dict[str, Any]:
         return {
             "model": inference.status(),
+            "modelDownload": model_downloader.status(),
             "rag": rag.status(),
             "resources": {"rssMb": process_memory_mb()},
             "documentCount": len(database.list_documents()),
@@ -111,6 +129,7 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
     app.extensions["rag"] = rag
     app.extensions["agent"] = agent
     app.extensions["inference"] = inference
+    app.extensions["model_downloader"] = model_downloader
     app.extensions["runtime_status"] = runtime_status
 
     @app.before_request
@@ -121,6 +140,12 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
             g.set_local_session_cookie = True
             g.local_session_token = token
         g.local_session_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        profile_token = request.cookies.get("edge_office_profile", "")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", profile_token):
+            profile_token = secrets.token_urlsafe(32)
+            g.set_profile_cookie = True
+            g.local_profile_token = profile_token
+        g.local_profile_id = hashlib.sha256(profile_token.encode("utf-8")).hexdigest()
 
     @app.after_request
     def persist_local_session(response: Response) -> Response:
@@ -128,6 +153,11 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
             response.set_cookie(
                 "edge_office_session", g.local_session_token,
                 max_age=24 * 60 * 60, httponly=True, samesite="Strict", secure=False,
+            )
+        if getattr(g, "set_profile_cookie", False):
+            response.set_cookie(
+                "edge_office_profile", g.local_profile_token,
+                max_age=365 * 24 * 60 * 60, httponly=True, samesite="Strict", secure=False,
             )
         return response
 
@@ -142,6 +172,55 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
     @app.get("/api/v1/runtime/status")
     def get_runtime_status() -> Response:
         return jsonify(runtime_status())
+
+    @app.get("/api/v1/model/download")
+    def model_download_status() -> Response:
+        return jsonify({"item": model_downloader.status()})
+
+    @app.post("/api/v1/model/download")
+    def start_model_download() -> Response:
+        payload = request.get_json(silent=True)
+        if payload not in (None, {}):
+            return error("UNTRUSTED_MODEL_DOWNLOAD_PAYLOAD", "模型下载不接受自定义链接或路径", 400)
+        try:
+            return jsonify({"item": model_downloader.start()}), 202
+        except ModelDownloadError as exc:
+            return error("MODEL_DOWNLOAD_UNAVAILABLE", str(exc), 409)
+
+    @app.get("/api/v1/preferences")
+    def get_preferences() -> Response:
+        return jsonify({"item": database.get_preferences(g.local_profile_id)})
+
+    @app.put("/api/v1/preferences")
+    def update_preferences() -> Response:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return error("INVALID_PREFERENCES", "偏好设置必须是 JSON 对象", 400)
+        changes: dict[str, Any] = {}
+        for api_key, database_key in {
+            "displayName": "display_name", "role": "role", "writingTone": "writing_tone", "lastView": "last_view",
+        }.items():
+            if api_key in payload:
+                value = str(payload[api_key]).strip()
+                if len(value) > 40:
+                    return error("INVALID_PREFERENCES", f"{api_key} 不能超过 40 个字符", 400)
+                changes[database_key] = value
+        if "writingTone" in payload and changes.get("writing_tone") not in {"professional", "concise", "natural"}:
+            return error("INVALID_PREFERENCES", "writingTone 不在允许范围内", 400)
+        if "lastView" in payload and changes.get("last_view") not in {"home", "chat", "knowledge", "tools"}:
+            return error("INVALID_PREFERENCES", "lastView 不在允许范围内", 400)
+        for api_key, database_key in {"ragEnabled": "rag_enabled", "onboardingComplete": "onboarding_complete"}.items():
+            if api_key in payload:
+                if not isinstance(payload[api_key], bool):
+                    return error("INVALID_PREFERENCES", f"{api_key} 必须是布尔值", 400)
+                changes[database_key] = payload[api_key]
+        for api_key, database_key in {"pinnedTools": "pinned_tools", "seenTips": "seen_tips"}.items():
+            if api_key in payload:
+                value = payload[api_key]
+                if not isinstance(value, list) or len(value) > 12 or any(not isinstance(item, str) or len(item) > 32 for item in value):
+                    return error("INVALID_PREFERENCES", f"{api_key} 格式不正确", 400)
+                changes[database_key] = value
+        return jsonify({"item": database.update_preferences(g.local_profile_id, changes)})
 
     @app.get("/api/v1/documents")
     def documents() -> Response:
@@ -263,14 +342,17 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
     def run_agent() -> Response:
         payload = request.get_json(silent=True) or {}
         message = str(payload.get("message") or "").strip()
+        display_message = str(payload.get("displayMessage") or message).strip()
         if not message:
             return error("EMPTY_MESSAGE", "请输入问题", 400)
+        if not display_message or len(display_message) > 1000:
+            return error("INVALID_DISPLAY_MESSAGE", "对话显示文本不能为空且不能超过 1000 个字符", 400)
         conversation_id = str(payload.get("conversationId") or "")
         if not conversation_id:
             conversation_id = database.create_conversation()["id"]
         if not database.get_conversation(conversation_id):
             return error("CONVERSATION_NOT_FOUND", "会话不存在", 404)
-        database.add_message(conversation_id, "user", message)
+        database.add_message(conversation_id, "user", display_message)
         request_id = str(uuid4())
         answer, citations, info, _ = agent.execute(message, conversation_id, payload.get("ragEnabled") is not False, request_id=request_id, session_id=g.local_session_id)
         timings = info.get("timings", {})
@@ -281,15 +363,18 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
     def chat_stream() -> Response:
         payload = request.get_json(silent=True) or {}
         message = str(payload.get("message") or "").strip()
+        display_message = str(payload.get("displayMessage") or message).strip()
         if not message:
             return error("EMPTY_MESSAGE", "请输入问题", 400)
+        if not display_message or len(display_message) > 1000:
+            return error("INVALID_DISPLAY_MESSAGE", "对话显示文本不能为空且不能超过 1000 个字符", 400)
         conversation_id = str(payload.get("conversationId") or "")
         if not conversation_id:
             conversation_id = database.create_conversation()["id"]
         if not database.get_conversation(conversation_id):
             return error("CONVERSATION_NOT_FOUND", "会话不存在", 404)
         rag_enabled = payload.get("ragEnabled") is not False
-        database.add_message(conversation_id, "user", message)
+        database.add_message(conversation_id, "user", display_message)
 
         def generate() -> Generator[str, None, None]:
             began = time.perf_counter()

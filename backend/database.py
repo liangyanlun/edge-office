@@ -152,6 +152,18 @@ class Database:
                   started_at TEXT NOT NULL,
                   completed_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS user_preferences (
+                  profile_id TEXT PRIMARY KEY,
+                  display_name TEXT NOT NULL DEFAULT '',
+                  role TEXT NOT NULL DEFAULT '科研学习',
+                  writing_tone TEXT NOT NULL DEFAULT 'professional',
+                  rag_enabled INTEGER NOT NULL DEFAULT 1,
+                  onboarding_complete INTEGER NOT NULL DEFAULT 0,
+                  pinned_tools_json TEXT NOT NULL DEFAULT '[]',
+                  seen_tips_json TEXT NOT NULL DEFAULT '[]',
+                  last_view TEXT NOT NULL DEFAULT 'home',
+                  updated_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON chunks(document_id);
                 CREATE INDEX IF NOT EXISTS idx_messages_conversation_id ON messages(conversation_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_agent_steps_run_id ON agent_steps(run_id, step_index);
@@ -224,6 +236,48 @@ class Database:
                     },
                 )
         return True
+
+    def get_preferences(self, profile_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO user_preferences(profile_id, updated_at)
+                   VALUES(?, ?)""",
+                (profile_id, now_iso()),
+            )
+            row = connection.execute("SELECT * FROM user_preferences WHERE profile_id = ?", (profile_id,)).fetchone()
+        return self._preferences(row)
+
+    def update_preferences(self, profile_id: str, changes: dict[str, Any]) -> dict[str, Any]:
+        allowed = {
+            "display_name": "display_name", "role": "role", "writing_tone": "writing_tone",
+            "rag_enabled": "rag_enabled", "onboarding_complete": "onboarding_complete",
+            "pinned_tools": "pinned_tools_json", "seen_tips": "seen_tips_json", "last_view": "last_view",
+        }
+        columns: list[str] = []
+        values: list[Any] = []
+        for key, column in allowed.items():
+            if key not in changes:
+                continue
+            value = changes[key]
+            if key in {"pinned_tools", "seen_tips"}:
+                value = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            elif key in {"rag_enabled", "onboarding_complete"}:
+                value = int(bool(value))
+            columns.append(f"{column} = ?")
+            values.append(value)
+        if not columns:
+            return self.get_preferences(profile_id)
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO user_preferences(profile_id, updated_at) VALUES(?, ?)",
+                (profile_id, now_iso()),
+            )
+            values.extend([now_iso(), profile_id])
+            connection.execute(
+                f"UPDATE user_preferences SET {', '.join(columns)}, updated_at = ? WHERE profile_id = ?",
+                values,
+            )
+        return self.get_preferences(profile_id)
 
     def list_documents(self, keyword: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         sql = "SELECT * FROM documents"
@@ -666,6 +720,18 @@ class Database:
             "ingestionStatus": document.get("ingestion_status", "ready"), "parserName": document.get("parser_name", "plain-text"),
             "extractionQuality": document.get("extraction_quality", "native"),
             "parserMetadata": json.loads(document.get("parser_metadata_json") or "{}"),
+        }
+
+    @staticmethod
+    def _preferences(row: sqlite3.Row | None) -> dict[str, Any]:
+        if row is None:
+            return {}
+        item = dict(row)
+        return {
+            "displayName": item["display_name"], "role": item["role"], "writingTone": item["writing_tone"],
+            "ragEnabled": bool(item["rag_enabled"]), "onboardingComplete": bool(item["onboarding_complete"]),
+            "pinnedTools": json.loads(item["pinned_tools_json"]), "seenTips": json.loads(item["seen_tips_json"]),
+            "lastView": item["last_view"], "updatedAt": item["updated_at"],
         }
 
     @staticmethod

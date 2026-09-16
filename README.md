@@ -37,6 +37,43 @@ python run_flask.py
 
 然后访问 <http://127.0.0.1:4300>。
 
+## Windows 安装包
+
+Windows 版不需要用户安装 Node.js 或 Python。程序安装后会启动本地 Flask 服务，并通过 Windows Edge WebView2 在独立应用窗口中显示界面，不会打开默认浏览器；关闭应用窗口会停止服务。Windows 10/11 通常已自带 WebView2 Runtime，如启动时提示缺少 WebView2，再安装 Microsoft Edge WebView2 Runtime 即可。
+
+运行时数据不会写入安装目录，而是保存在 `%LOCALAPPDATA%\EdgeOffice\artifacts\`：SQLite 数据库在 `data/`，FAISS 索引在 `indexes/`，模型在 `models/`。卸载程序不会删除这些用户材料。
+
+GGUF 模型单独从 GitHub Releases 下载，避免让安装包额外增加约 812 MB。模型不可用时，应用顶部会显示“下载本地模型”按钮；点击后 Flask 只会从 `liangyanlun/edge-office` 的已配置 Release 下载，完成 SHA-256 校验后自动写入：
+
+```text
+%LOCALAPPDATA%\EdgeOffice\artifacts\models\qwen3_5_0p8_office_q8_0\
+```
+
+Release 至少需要上传同名 GGUF 资源 `Qwen3.5-0.8B-office.Q8_0.gguf`，并附带 `release.manifest.json` 或 `Qwen3.5-0.8B-office.Q8_0.SHA256SUMS.txt`（也兼容标准名 `SHA256SUMS.txt`）。发布清单优先校验文件名、SHA-256、量化格式、2048 上下文和验收状态；校验文件须包含一行 `SHA256<两个空格>文件名`，用于严格验证 GGUF 文件完整性。开发环境要求至少提供其中一种校验元数据。
+
+`release.manifest.json` 示例：
+
+```json
+{
+  "schema": "edge_office_model_release_v1",
+  "model_file": "Qwen3.5-0.8B-office.Q8_0.gguf",
+  "sha256": "GGUF 文件的 64 位 SHA-256",
+  "quantization": "Q8_0",
+  "context_length": 2048,
+  "acceptance_passed": true
+}
+```
+
+默认固定下载已验证的 `v0.1.0` Release，避免首次下载受 GitHub 匿名 API 限流影响；维护者可通过 `MODEL_RELEASE_TAG` 覆盖目标标签。`MODEL_RELEASE_REPOSITORY` 默认是 `liangyanlun/edge-office`，浏览器端不接受自定义下载链接或保存路径。
+
+维护者在已安装 Inno Setup 6 的 Windows 环境运行：
+
+```powershell
+.\packaging\build.ps1
+```
+
+输出文件为 `dist-installer\EdgeOffice-Setup-v0.1.0.exe`。仅生成便携版可执行目录时运行 `.\packaging\build.ps1 -SkipInstaller`。
+
 ## 测试
 
 ```powershell

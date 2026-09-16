@@ -3,148 +3,134 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#13213f" />
-    <title>微知 Edge Office · 初步 Demo</title>
+    <meta name="theme-color" content="#15263a" />
+    <title>微知 Edge Office</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
-  <body>
-    <div class="app-shell">
+  <body class="booting">
+    <div class="splash-screen" id="app-splash" aria-live="polite">
+      <div class="splash-mark" aria-hidden="true">微</div>
+      <strong>微知 Edge Office</strong>
+      <span id="splash-status">正在准备本地工作区</span>
+    </div>
+
+    <div class="onboarding-layer hidden" id="onboarding-layer" aria-modal="true" role="dialog" aria-label="首次使用引导">
+      <section class="onboarding-dialog">
+        <header class="onboarding-header">
+          <span>首次设置</span>
+          <strong id="onboarding-step-label">第 1 / 4 步</strong>
+        </header>
+        <div class="onboarding-progress" aria-hidden="true"><span id="onboarding-progress"></span></div>
+        <div class="onboarding-step active" data-onboarding-step="0">
+          <p class="section-kicker">本地智能办公助手</p>
+          <h1>让材料、思路和任务在同一个工作区协作</h1>
+          <p>微知在本机处理知识库与模型推理。你可以从材料提问开始，也可以直接组织一项办公任务。</p>
+          <div class="trust-list" aria-label="核心特性">
+            <div><strong>本机处理</strong><span>材料和模型数据不会上传</span></div>
+            <div><strong>引用可查</strong><span>知识问答保留原文依据</span></div>
+            <div><strong>行动可控</strong><span>外部操作执行前由你确认</span></div>
+          </div>
+          <div class="onboarding-actions">
+            <button class="text-button" type="button" id="onboarding-skip">跳过引导</button>
+            <button class="primary-button" type="button" data-onboarding-next>继续 <span aria-hidden="true">→</span></button>
+          </div>
+        </div>
+        <div class="onboarding-step" data-onboarding-step="1">
+          <p class="section-kicker">工作方式</p>
+          <h2>围绕一件具体工作开始</h2>
+          <div class="capability-grid">
+            <article><small>01</small><strong>材料理解</strong><span>检索、引用、摘要与对比</span></article>
+            <article><small>02</small><strong>内容写作</strong><span>邮件、通知、提纲与润色</span></article>
+            <article><small>03</small><strong>任务整理</strong><span>会议纪要、待办与时间节点</span></article>
+            <article><small>04</small><strong>安全行动</strong><span>计划预览后再由你确认</span></article>
+          </div>
+          <div class="onboarding-actions">
+            <button class="text-button" type="button" data-onboarding-back>上一步</button>
+            <button class="primary-button" type="button" data-onboarding-next>继续 <span aria-hidden="true">→</span></button>
+          </div>
+        </div>
+        <div class="onboarding-step" data-onboarding-step="2">
+          <p class="section-kicker">为你准备</p>
+          <h2>设置你的工作偏好</h2>
+          <form class="profile-form" id="onboarding-profile-form">
+            <label>称呼<input name="displayName" maxlength="40" placeholder="例如：言伦" /></label>
+            <label>主要场景<select name="role"><option>科研学习</option><option>项目管理</option><option>行政办公</option><option>材料写作</option></select></label>
+            <label>默认表达<select name="writingTone"><option value="professional">正式专业</option><option value="concise">简洁直接</option><option value="natural">自然友好</option></select></label>
+            <label class="check-row"><input name="ragEnabled" type="checkbox" checked /> 默认使用本地知识库</label>
+          </form>
+          <div class="onboarding-actions">
+            <button class="text-button" type="button" data-onboarding-back>上一步</button>
+            <button class="primary-button" type="button" data-onboarding-next>继续 <span aria-hidden="true">→</span></button>
+          </div>
+        </div>
+        <div class="onboarding-step" data-onboarding-step="3">
+          <p class="section-kicker">开始第一项工作</p>
+          <h2>选择一个起点</h2>
+          <p class="onboarding-helper">下面四项都是可点击操作，选择后会直接进入对应工作区。</p>
+          <div class="first-task-grid">
+            <button type="button" data-first-task="import"><span><strong>导入材料</strong><small>建立本地知识库</small></span><b aria-hidden="true">→</b></button>
+            <button type="button" data-first-task="summary"><span><strong>总结材料</strong><small>提取重点与结论</small></span><b aria-hidden="true">→</b></button>
+            <button type="button" data-first-task="email"><span><strong>撰写邮件</strong><small>先生成可编辑草稿</small></span><b aria-hidden="true">→</b></button>
+            <button type="button" data-first-task="chat"><span><strong>直接对话</strong><small>从一个问题开始</small></span><b aria-hidden="true">→</b></button>
+          </div>
+          <div class="onboarding-actions"><button class="text-button" type="button" data-onboarding-back>上一步</button></div>
+        </div>
+      </section>
+    </div>
+
+    <div class="app-shell" id="app-shell">
       <aside class="sidebar" aria-label="主导航">
-        <div class="brand">
-          <span class="brand-mark" aria-hidden="true">✦</span>
-          <div>
-            <strong>微知 Edge Office</strong>
-            <span>本地知识增强助手</span>
-          </div>
-        </div>
-
-        <nav class="navigation" aria-label="功能导航">
-          <button class="nav-item active" type="button" data-view="chat" data-testid="nav-chat">
-            <span aria-hidden="true">⌁</span> 智能对话
-          </button>
-          <button class="nav-item" type="button" data-view="knowledge" data-testid="nav-knowledge">
-            <span aria-hidden="true">▤</span> 知识库
-          </button>
+        <button class="brand" type="button" data-view="home" title="返回工作台">
+          <span class="brand-mark" aria-hidden="true">微</span>
+          <span><strong>微知</strong><small>Edge Office</small></span>
+        </button>
+        <nav class="navigation" aria-label="工作区">
+          <button class="nav-item active" type="button" data-view="home"><span aria-hidden="true">⌂</span> 工作台</button>
+          <button class="nav-item" type="button" data-view="chat"><span aria-hidden="true">◌</span> 智能对话</button>
+          <button class="nav-item" type="button" data-view="knowledge"><span aria-hidden="true">▤</span> 知识库</button>
+          <button class="nav-item" type="button" data-view="tools"><span aria-hidden="true">◇</span> 全部工具</button>
         </nav>
-
         <div class="sidebar-spacer"></div>
-        <div class="local-card">
+        <button class="local-card" id="open-settings" type="button" title="个人设置">
           <span class="status-dot"></span>
-          <div>
-            <strong>本地演示服务</strong>
-            <small id="sidebar-service-status">正在检查…</small>
-          </div>
-        </div>
+          <span><strong id="profile-label">本地工作区</strong><small id="sidebar-service-status">正在检查服务</small></span>
+        </button>
       </aside>
 
       <main class="workspace">
         <header class="topbar">
-          <div>
-            <p class="eyebrow" id="view-eyebrow">LOCAL RAG DEMO</p>
-            <h1 id="view-title">智能对话</h1>
-          </div>
-          <div class="runtime-badge" id="runtime-badge" aria-live="polite">
-            <span class="status-dot"></span>
-            <span>本地引擎加载中</span>
+          <div><p class="section-kicker" id="view-eyebrow">PERSONAL WORKSPACE</p><h1 id="view-title">工作台</h1></div>
+          <div class="topbar-actions">
+            <button class="command-button" id="open-command" type="button" title="打开命令菜单"><span aria-hidden="true">/</span> 快速任务</button>
+            <button class="model-download-button hidden" id="model-download-button" type="button" title="从已配置的 GitHub Release 下载本地模型">下载本地模型</button>
+            <div class="runtime-badge" id="runtime-badge" aria-live="polite"><span class="status-dot"></span><span>本地引擎加载中</span></div>
           </div>
         </header>
 
-        <section class="view active" id="chat-view" aria-labelledby="view-title">
-          <aside class="conversation-panel">
-            <button class="primary-button new-chat-button" id="new-chat-button" type="button" data-testid="new-chat">
-              <span aria-hidden="true">＋</span> 新建对话
-            </button>
-            <p class="panel-label">本次演示</p>
-            <div class="conversation-list" id="conversation-list" aria-live="polite"></div>
-            <div class="demo-note">
-              <strong>初步 Demo</strong>
-              <p>Flask 直连 llama.cpp，并以本地 FAISS + BM25 提供可追溯检索。</p>
-            </div>
-          </aside>
-
-          <section class="chat-panel" aria-label="聊天内容">
-            <div class="chat-toolbar">
-              <div class="knowledge-toggle">
-                <span class="mini-label">知识增强</span>
-                <label class="switch">
-                  <input id="rag-toggle" type="checkbox" checked />
-                  <span class="switch-slider"></span>
-                </label>
-                <span id="rag-label">已启用</span>
-              </div>
-              <span class="privacy-label">⌂ 数据仅在本机演示服务中处理</span>
-            </div>
-
-            <div class="messages" id="messages" aria-live="polite" data-testid="messages">
-              <div class="welcome-card" id="welcome-card">
-                <span class="welcome-icon" aria-hidden="true">✦</span>
-                <p class="eyebrow">边缘智能 · 可追溯回答</p>
-                <h2>从本地资料中找到有依据的答案</h2>
-                <p>可以直接询问项目目标、精准 RAG 或部署指标。每次回答都会显示引用来源和实际接口耗时。</p>
-                <div class="suggestion-grid" aria-label="示例问题">
-                  <button type="button" class="suggestion" data-question="这个项目的核心创新是什么？">核心创新是什么？</button>
-                  <button type="button" class="suggestion" data-question="系统的性能目标有哪些？">系统的性能目标有哪些？</button>
-                  <button type="button" class="suggestion" data-question="精准 RAG 为什么适合边缘设备？">RAG 为什么适合边缘设备？</button>
-                </div>
-              </div>
-            </div>
-
-            <form class="composer" id="chat-form">
-              <label class="sr-only" for="chat-input">输入问题</label>
-              <textarea id="chat-input" rows="1" maxlength="1000" placeholder="输入问题，Enter 发送，Shift + Enter 换行" data-testid="chat-input"></textarea>
-              <div class="composer-footer">
-                <span id="composer-hint">本地知识库将参与回答</span>
-                <div class="composer-actions">
-                  <button class="ghost-button hidden" id="stop-button" type="button" data-testid="stop-chat">停止生成</button>
-                  <button class="primary-button" id="send-button" type="submit" data-testid="send-chat">发送 <span aria-hidden="true">↗</span></button>
-                </div>
-              </div>
-            </form>
-          </section>
-
-          <aside class="evidence-panel" aria-label="证据与指标">
-            <div class="evidence-heading">
-              <div>
-                <p class="panel-label">可追溯证据</p>
-                <h2>本轮依据</h2>
-              </div>
-              <span class="counter" id="evidence-count">0</span>
-            </div>
-            <div id="evidence-list" class="evidence-list empty-state">
-              <p>回答中的引用会显示在这里。</p>
-            </div>
-
-            <div class="metric-heading">
-              <p class="panel-label">运行指标</p>
-              <span>真实接口采样</span>
-            </div>
-            <div class="metric-grid" id="metric-grid">
-              <div class="metric" title="从提交问题到首段回答可发送"><span>首字响应</span><strong id="metric-ttft">—</strong></div>
-              <div class="metric" title="仅计算本地知识库搜索与重排"><span>检索耗时</span><strong id="metric-retrieval">—</strong></div>
-              <div class="metric" title="llama.cpp 实际输出 token 数除以模型推理耗时"><span>生成速度</span><strong id="metric-speed">—</strong></div>
-              <div class="metric" title="当前 Flask 进程工作集"><span>内存占用</span><strong id="metric-memory">—</strong></div>
-            </div>
-            <p class="metric-footnote">生成速度采用 llama.cpp 的实际 completion_tokens / 推理耗时。</p>
-          </aside>
+        <section class="view active" id="home-view" aria-label="工作台">
+          <header class="dashboard-intro"><p class="section-kicker">你的本地工作区</p><h2 id="dashboard-greeting">准备开始今天的工作</h2><p id="dashboard-context">从一个问题、一份材料或一项待处理事务开始。</p></header>
+          <div class="workspace-stats" id="workspace-stats" aria-live="polite"></div>
+          <section class="dashboard-section"><div class="section-heading"><div><p class="section-kicker">常用操作</p><h2>开始处理</h2></div><button class="text-button" type="button" data-view="tools">查看全部工具</button></div><div class="task-grid" id="quick-actions"></div></section>
+          <section class="dashboard-section recommendation-section" id="recommendation-section"></section>
+          <section class="dashboard-section"><div class="section-heading"><div><p class="section-kicker">最近工作</p><h2>继续上次的上下文</h2></div><button class="text-button" type="button" data-view="chat">打开对话</button></div><div class="recent-list" id="recent-conversations"></div></section>
         </section>
 
-        <section class="view" id="knowledge-view" aria-label="知识库">
-          <div class="knowledge-header">
-            <div>
-              <p class="eyebrow">LOCAL KNOWLEDGE BASE</p>
-              <h2>知识库材料</h2>
-              <p>支持离线导入 TXT、Markdown、PDF/OCR、DOCX、XLSX、CSV、PPTX 与 HTML；解析成功后立即纳入下一轮检索。</p>
-            </div>
-            <div>
-              <input id="document-file" type="file" accept=".txt,.md,.pdf,.docx,.xlsx,.csv,.pptx,.html,.htm,text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/csv,text/html" hidden />
-              <button class="primary-button" id="import-button" type="button" data-testid="import-document">导入本地材料</button>
-            </div>
-          </div>
-          <div class="knowledge-summary" id="knowledge-summary"></div>
-          <div class="document-list" id="document-list" data-testid="document-list"></div>
+        <section class="view" id="chat-view" aria-label="智能对话">
+          <aside class="conversation-panel"><button class="primary-button new-chat-button" id="new-chat-button" type="button">新建对话</button><p class="panel-label">最近对话</p><div class="conversation-list" id="conversation-list" aria-live="polite"></div><div class="panel-footnote"><strong>本机运行</strong><p>回答、检索证据和行动计划都保留在本地工作区。</p></div></aside>
+          <section class="chat-panel" aria-label="聊天内容"><div class="chat-toolbar"><div class="knowledge-toggle"><span class="mini-label">知识增强</span><label class="switch"><input id="rag-toggle" type="checkbox" checked /><span class="switch-slider"></span></label><span id="rag-label">已启用</span></div><span class="privacy-label">本地材料不会上传</span></div><div class="messages" id="messages" aria-live="polite"></div><div class="context-actions" id="context-actions" aria-label="推荐任务"></div><form class="composer" id="chat-form"><div class="active-tool-hint hidden" id="active-tool-hint"><div><strong id="active-tool-title"></strong><span id="active-tool-detail"></span></div><button class="icon-button" type="button" id="clear-active-tool" title="取消当前任务" aria-label="取消当前任务">×</button></div><label class="sr-only" for="chat-input">输入问题</label><textarea id="chat-input" rows="1" maxlength="1000" placeholder="输入你的问题" data-testid="chat-input"></textarea><div class="composer-footer"><span id="composer-hint">本地知识库将参与回答</span><div class="composer-actions"><button class="ghost-button hidden" id="stop-button" type="button">停止</button><button class="primary-button" id="send-button" type="submit">发送</button></div></div></form></section>
+          <aside class="insight-panel" aria-label="依据与状态"><div class="insight-tabs"><button class="insight-tab active" type="button" data-insight="evidence">引用依据</button><button class="insight-tab" type="button" data-insight="metrics">运行状态</button></div><section class="insight-content active" data-insight-content="evidence"><div class="evidence-heading"><div><p class="panel-label">可追溯证据</p><h2>本轮依据</h2></div><span class="counter" id="evidence-count">0</span></div><div id="evidence-list" class="evidence-list empty-state"><p>回答中的引用会显示在这里。</p></div></section><section class="insight-content" data-insight-content="metrics"><div class="metric-heading"><div><p class="panel-label">运行指标</p><h2>真实接口采样</h2></div></div><div class="metric-grid" id="metric-grid"><div class="metric" title="从提交问题到首段回答可发送"><span>首字响应</span><strong id="metric-ttft">—</strong></div><div class="metric" title="仅计算本地知识库搜索与重排"><span>检索耗时</span><strong id="metric-retrieval">—</strong></div><div class="metric" title="llama.cpp 实际输出 token 数除以模型推理耗时"><span>生成速度</span><strong id="metric-speed">—</strong></div><div class="metric" title="当前 Flask 进程工作集"><span>内存占用</span><strong id="metric-memory">—</strong></div></div><p class="metric-footnote">生成速度只使用 llama.cpp 返回的实际 token 与推理耗时计算。</p></section></aside>
         </section>
+
+        <section class="view" id="knowledge-view" aria-label="知识库"><div class="knowledge-header"><div><p class="section-kicker">LOCAL KNOWLEDGE BASE</p><h2>知识库材料</h2><p>导入后会建立本地索引，用于后续问答、摘要和对比。</p></div><div><input id="document-file" type="file" accept=".txt,.md,.pdf,.docx,.xlsx,.csv,.pptx,.html,.htm,text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/csv,text/html" hidden /><button class="primary-button" id="import-button" type="button">导入本地材料</button></div></div><div class="knowledge-summary" id="knowledge-summary"></div><div class="document-list" id="document-list" data-testid="document-list"></div></section>
+
+        <section class="view" id="tools-view" aria-label="全部工具"><header class="tools-header"><p class="section-kicker">TASK LIBRARY</p><h2>全部工具</h2><p>选择一个任务后，系统会带入合适的对话模板。涉及外部发送、提交或删除的操作仍需要单独确认。</p></header><div class="tool-groups" id="tool-groups"></div></section>
       </main>
     </div>
+
+    <div class="modal-layer hidden" id="settings-layer" aria-modal="true" role="dialog" aria-labelledby="settings-title"><section class="settings-dialog"><div class="dialog-heading"><div><p class="section-kicker">PERSONAL PREFERENCES</p><h2 id="settings-title">个人设置</h2></div><button class="icon-button" id="close-settings" type="button" title="关闭">×</button></div><form class="profile-form" id="settings-form"><label>称呼<input name="displayName" maxlength="40" /></label><label>主要场景<select name="role"><option>科研学习</option><option>项目管理</option><option>行政办公</option><option>材料写作</option></select></label><label>默认表达<select name="writingTone"><option value="professional">正式专业</option><option value="concise">简洁直接</option><option value="natural">自然友好</option></select></label><label class="check-row"><input name="ragEnabled" type="checkbox" /> 默认使用本地知识库</label><div class="dialog-actions"><button class="text-button" id="restart-onboarding" type="button">重新查看引导</button><button class="primary-button" type="submit">保存设置</button></div></form></section></div>
+
+    <div class="modal-layer hidden" id="command-layer" aria-modal="true" role="dialog" aria-labelledby="command-title"><section class="command-dialog"><div class="command-input-wrap"><span aria-hidden="true">/</span><input id="command-input" autocomplete="off" placeholder="搜索任务，例如：总结、邮件、待办" /><button class="icon-button" id="close-command" type="button" title="关闭">×</button></div><h2 class="sr-only" id="command-title">快速任务</h2><div class="command-list" id="command-list"></div></section></div>
+    <div class="context-tip hidden" id="context-tip" role="status"><p id="context-tip-text"></p><button class="icon-button" type="button" id="close-context-tip" title="关闭">×</button></div>
     <div class="toast hidden" id="toast" role="status" aria-live="polite"></div>
     <script type="module" src="/app.js"></script>
   </body>

@@ -10,7 +10,7 @@ from typing import Any
 
 try:
     from llama_cpp import Llama, LlamaGrammar
-except ImportError:  # Keep document/RAG functions usable until dependencies are installed.
+except (ImportError, OSError):  # Keep document/RAG functions usable when native llama.cpp libraries are unavailable.
     Llama = None  # type: ignore[assignment,misc]
     LlamaGrammar = None  # type: ignore[assignment,misc]
 
@@ -49,6 +49,7 @@ class InferenceAdapter:
         n_threads: int = 4,
         n_gpu_layers: int = 0,
         release_manifest: Path | str = "",
+        release_checksum: Path | str = "",
         release_required: bool = True,
     ):
         self.registry = registry
@@ -58,6 +59,7 @@ class InferenceAdapter:
         self.n_threads = n_threads
         self.n_gpu_layers = n_gpu_layers
         self.release_manifest = Path(release_manifest) if release_manifest else Path()
+        self.release_checksum = Path(release_checksum) if release_checksum else Path()
         self.release_required = release_required
         self._release: dict[str, Any] | None = None
         self._model: Any | None = None
@@ -76,7 +78,8 @@ class InferenceAdapter:
         if not self.llama_cpp_enabled:
             return base
         manifest_available = self.release_manifest.is_file()
-        available = Llama is not None and self.model_path.is_file() and (manifest_available or not self.release_required)
+        checksum_available = self.release_checksum.is_file()
+        available = Llama is not None and self.model_path.is_file() and (manifest_available or checksum_available or not self.release_required)
         return {
             **base,
             "name": self.model_path.stem if self.model_path.name else "未配置 GGUF 模型",
@@ -85,11 +88,26 @@ class InferenceAdapter:
             "modelPath": str(self.model_path),
             "releaseManifest": str(self.release_manifest),
             "releaseManifestRequired": self.release_required,
+            "releaseChecksum": str(self.release_checksum),
+            "releaseChecksumAvailable": checksum_available,
             "releaseVerified": self._release is not None,
             "loaded": self._model is not None,
             "status": "llama-cpp-ready" if available else "llama-cpp-unavailable",
             "error": self._load_error or None,
         }
+
+    def can_replace_model_file(self) -> bool:
+        """A loaded llama.cpp model keeps its GGUF file open on Windows."""
+        with self._load_lock:
+            return self._model is None
+
+    def refresh_model_file_state(self) -> None:
+        """Forget prior manifest/load errors after a verified local installation."""
+        with self._load_lock:
+            if self._model is not None:
+                raise RuntimeError("本地模型已加载，无法刷新模型文件")
+            self._release = None
+            self._load_error = ""
 
     def compose_answer(self, question: str, evidence: list[dict[str, Any]], rag_enabled: bool, agent_action: str = "search_knowledge") -> str:
         self.reset_generation_metrics()
@@ -189,8 +207,10 @@ class InferenceAdapter:
 
     def _verify_release_manifest(self) -> dict[str, Any]:
         if not self.release_manifest.is_file():
+            if self.release_checksum.is_file():
+                return self._verify_release_checksum()
             if self.release_required:
-                raise RuntimeError(f"缺少模型发布清单：{self.release_manifest}")
+                raise RuntimeError("缺少模型发布清单或 SHA-256 校验文件")
             return {"developmentOverride": True}
         try:
             manifest = json.loads(self.release_manifest.read_text(encoding="utf-8"))
@@ -215,6 +235,28 @@ class InferenceAdapter:
         if digest.hexdigest() != manifest.get("sha256"):
             raise RuntimeError("GGUF 文件哈希与发布清单不一致")
         return manifest
+
+    def _verify_release_checksum(self) -> dict[str, Any]:
+        try:
+            lines = self.release_checksum.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError) as error:
+            raise RuntimeError("模型 SHA-256 校验文件不可读") from error
+        expected = None
+        pattern = re.compile(r"^([0-9a-fA-F]{64})\s+\*?(.+?)\s*$")
+        for line in lines:
+            match = pattern.match(line.strip())
+            if match and Path(match.group(2)).name == self.model_path.name:
+                expected = match.group(1).lower()
+                break
+        if expected is None:
+            raise RuntimeError("SHA-256 校验文件未包含当前 GGUF")
+        digest = hashlib.sha256()
+        with self.model_path.open("rb") as handle:
+            for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(block)
+        if digest.hexdigest() != expected:
+            raise RuntimeError("GGUF 文件哈希与 SHA-256 校验文件不一致")
+        return {"verification": "sha256sums", "model_file": self.model_path.name, "sha256": expected}
 
     def _generate_without_rag(self, question: str) -> str:
         system = "你是本地离线办公助手。用简洁中文回答，最多三句话；不展示思考过程；对不确定的信息明确说明不确定。当前未启用知识库检索，因此不得声称查阅了本地文档或编造引用。"

@@ -4,6 +4,9 @@ node_modules/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+build/
+dist/
+dist-installer/
 
 # Local runtime data and generated indexes
 artifacts/data/

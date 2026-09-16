@@ -1,17 +1,41 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+def _resource_root() -> Path:
+    """Return bundled resources when frozen, otherwise the source checkout."""
+    if getattr(sys, "frozen", False) and getattr(sys, "_MEIPASS", None):
+        return Path(sys._MEIPASS).resolve()
+    return Path(__file__).resolve().parent.parent
+
+
+ROOT_DIR = _resource_root()
+
+
+def _runtime_root() -> Path:
+    """Keep mutable user data outside the installed application directory."""
+    configured = os.getenv("EDGE_OFFICE_HOME", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    if getattr(sys, "frozen", False):
+        local_app_data = os.getenv("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return (Path(local_app_data) / "EdgeOffice").resolve()
+    return ROOT_DIR
 
 
 def default_config() -> dict[str, object]:
-    artifacts = ROOT_DIR / "artifacts"
+    runtime_root = _runtime_root()
+    artifacts = runtime_root / "artifacts"
     default_embedding_model = artifacts / "models" / "bge-small-zh-v1.5"
+    default_model_dir = artifacts / "models" / "qwen3_5_0p8_office_q8_0"
+    default_model_file = default_model_dir / "Qwen3.5-0.8B-office.Q8_0.gguf"
+    release_required_default = "false" if getattr(sys, "frozen", False) else "true"
     return {
         "ROOT_DIR": ROOT_DIR,
+        "RUNTIME_DIR": runtime_root,
         "DATA_DIR": artifacts / "data",
         "INDEX_DIR": artifacts / "indexes",
         "MODELS_DIR": artifacts / "models",
@@ -33,13 +57,26 @@ def default_config() -> dict[str, object]:
         "LLAMA_CPP_ENABLED": os.getenv("LLAMA_CPP_ENABLED", "true").lower() in {"1", "true", "yes"},
         "LLAMA_MODEL_PATH": os.getenv(
             "LLAMA_MODEL_PATH",
-            str(artifacts / "models" / "qwen3_0p8_gguf" / "Qwen3.5-0.8B.Q4_K_M.gguf"),
+            str(default_model_file),
         ),
         "LLAMA_RELEASE_MANIFEST": os.getenv(
             "LLAMA_RELEASE_MANIFEST",
-            str(artifacts / "models" / "qwen3_0p8_gguf" / "release.manifest.json"),
+            str(default_model_dir / "release.manifest.json"),
         ),
-        "LLAMA_RELEASE_REQUIRED": os.getenv("LLAMA_RELEASE_REQUIRED", "true").lower() in {"1", "true", "yes"},
+        "LLAMA_RELEASE_CHECKSUM": os.getenv(
+            "LLAMA_RELEASE_CHECKSUM",
+            str(default_model_dir / f"{default_model_file.stem}.SHA256SUMS.txt"),
+        ),
+        "LLAMA_RELEASE_REQUIRED": os.getenv("LLAMA_RELEASE_REQUIRED", release_required_default).lower() in {"1", "true", "yes"},
+        # The downloader is intentionally pinned to one public repository. The
+        # browser never provides a URL or a destination path.
+        "MODEL_RELEASE_DOWNLOAD_ENABLED": os.getenv("MODEL_RELEASE_DOWNLOAD_ENABLED", "true").lower() in {"1", "true", "yes"},
+        "MODEL_RELEASE_REPOSITORY": os.getenv("MODEL_RELEASE_REPOSITORY", "liangyanlun/edge-office"),
+        # Pin the public model release so first-run downloads do not depend on
+        # GitHub's unauthenticated API quota. Maintainers can still override it.
+        "MODEL_RELEASE_TAG": os.getenv("MODEL_RELEASE_TAG", "v0.1.0").strip(),
+        "MODEL_DOWNLOAD_TIMEOUT_SECONDS": int(os.getenv("MODEL_DOWNLOAD_TIMEOUT_SECONDS", "30")),
+        "MODEL_DOWNLOAD_MAX_BYTES": int(os.getenv("MODEL_DOWNLOAD_MAX_BYTES", str(2 * 1024 * 1024 * 1024))),
         "LLAMA_N_CTX": int(os.getenv("LLAMA_N_CTX", "2048")),
         "LLAMA_N_THREADS": int(os.getenv("LLAMA_N_THREADS", str(max(1, (os.cpu_count() or 2) // 2)))),
         "LLAMA_N_GPU_LAYERS": int(os.getenv("LLAMA_N_GPU_LAYERS", "0")),

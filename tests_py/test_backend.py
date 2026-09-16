@@ -10,7 +10,9 @@ import pytest
 from backend.app import create_app
 from backend.agent import AgentOrchestrator, PlanValidationError, parse_action_plan
 from backend.config import ROOT_DIR
+from backend.config import default_config
 from backend.inference import InferenceAdapter
+from backend.model_download import ModelDownloadError, ModelReleaseDownloader
 from backend.parsers import ParseError, parse_upload
 from backend.rag import FaissRagService
 
@@ -48,6 +50,148 @@ def test_health_and_faiss_index_are_ready(client, app, tmp_path: Path):
     assert runtime["rag"]["embedding"]["mode"] == "offline-fallback"
     assert runtime["ingestion"]["formats"] == ["txt", "md", "pdf", "docx", "xlsx", "csv", "pptx", "html"]
     assert runtime["ingestion"]["ocr"]["enabled"] is False
+    assert runtime["modelDownload"]["repository"] == "liangyanlun/edge-office"
+
+
+class _DownloadResponse:
+    def __init__(self, body: bytes):
+        self._body = body
+        self._offset = 0
+        self.headers = {"Content-Length": str(len(body))}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = len(self._body) - self._offset
+        result = self._body[self._offset:self._offset + size]
+        self._offset += len(result)
+        return result
+
+
+def test_model_release_downloader_installs_only_verified_release_assets(tmp_path: Path):
+    models_dir = tmp_path / "models"
+    model_path = models_dir / "qwen" / "Qwen3.5-0.8B-office.Q8_0.gguf"
+    manifest_path = model_path.with_name("release.manifest.json")
+    checksum_path = model_path.with_name(f"{model_path.stem}.SHA256SUMS.txt")
+    model_bytes = b"verified-gguf"
+    manifest_bytes = json.dumps({
+        "schema": "edge_office_model_release_v1",
+        "model_file": model_path.name,
+        "sha256": hashlib.sha256(model_bytes).hexdigest(),
+        "quantization": "Q8_0",
+        "context_length": 2048,
+        "acceptance_passed": True,
+    }).encode("utf-8")
+    base = "https://github.com/liangyanlun/edge-office/releases/download/v0.1.0"
+    release_url = "https://api.github.com/repos/liangyanlun/edge-office/releases/latest"
+    release_bytes = json.dumps({"tag_name": "v0.1.0", "assets": [
+        {"name": model_path.name, "size": len(model_bytes), "browser_download_url": f"{base}/{model_path.name}"},
+        {"name": manifest_path.name, "size": len(manifest_bytes), "browser_download_url": f"{base}/{manifest_path.name}"},
+    ]}).encode("utf-8")
+    payloads = {release_url: release_bytes, f"{base}/{model_path.name}": model_bytes, f"{base}/{manifest_path.name}": manifest_bytes}
+
+    def opener(request, timeout):
+        assert timeout == 30
+        return _DownloadResponse(payloads[request.full_url])
+
+    downloader = ModelReleaseDownloader(
+        enabled=True, repository="liangyanlun/edge-office", release_tag="", models_dir=models_dir,
+        model_path=model_path, manifest_path=manifest_path, checksum_path=checksum_path, n_ctx=2048, release_required=True, opener=opener,
+    )
+    result = downloader.install_sync()
+    assert result["state"] == "completed"
+    assert result["verification"] == "release-manifest-sha256"
+    assert model_path.read_bytes() == model_bytes
+    assert json.loads(manifest_path.read_text(encoding="utf-8"))["sha256"] == hashlib.sha256(model_bytes).hexdigest()
+
+
+def test_model_release_downloader_rejects_untrusted_asset_url(tmp_path: Path):
+    models_dir = tmp_path / "models"
+    model_path = models_dir / "qwen" / "Qwen3.5-0.8B-office.Q8_0.gguf"
+    manifest_path = model_path.with_name("release.manifest.json")
+    checksum_path = model_path.with_name(f"{model_path.stem}.SHA256SUMS.txt")
+    release_url = "https://api.github.com/repos/liangyanlun/edge-office/releases/latest"
+    release_bytes = json.dumps({"tag_name": "v0.1.0", "assets": [
+        {"name": model_path.name, "size": 12, "browser_download_url": "https://example.invalid/model.gguf"},
+    ]}).encode("utf-8")
+
+    def opener(request, timeout):
+        return _DownloadResponse(release_bytes if request.full_url == release_url else b"")
+
+    downloader = ModelReleaseDownloader(
+        enabled=True, repository="liangyanlun/edge-office", release_tag="", models_dir=models_dir,
+        model_path=model_path, manifest_path=manifest_path, checksum_path=checksum_path, n_ctx=2048, release_required=False, opener=opener,
+    )
+    with pytest.raises(ModelDownloadError, match="不受信任"):
+        downloader.install_sync()
+    assert not model_path.exists()
+
+
+def test_model_release_downloader_accepts_matching_sha256sums_when_manifest_is_absent(tmp_path: Path):
+    models_dir = tmp_path / "models"
+    model_path = models_dir / "qwen" / "Qwen3.5-0.8B-office.Q8_0.gguf"
+    manifest_path = model_path.with_name("release.manifest.json")
+    checksum_path = model_path.with_name(f"{model_path.stem}.SHA256SUMS.txt")
+    model_bytes = b"checksum-verified-gguf"
+    checksum_bytes = f"{hashlib.sha256(model_bytes).hexdigest()}  {model_path.name}\n".encode("utf-8")
+    base = "https://github.com/liangyanlun/edge-office/releases/download/v0.1.0"
+    release_url = "https://api.github.com/repos/liangyanlun/edge-office/releases/latest"
+    release_bytes = json.dumps({"tag_name": "v0.1.0", "assets": [
+        {"name": model_path.name, "size": len(model_bytes), "browser_download_url": f"{base}/{model_path.name}"},
+        {"name": checksum_path.name, "size": len(checksum_bytes), "browser_download_url": f"{base}/{checksum_path.name}"},
+    ]}).encode("utf-8")
+    payloads = {release_url: release_bytes, f"{base}/{model_path.name}": model_bytes, f"{base}/{checksum_path.name}": checksum_bytes}
+
+    def opener(request, timeout):
+        return _DownloadResponse(payloads[request.full_url])
+
+    downloader = ModelReleaseDownloader(
+        enabled=True, repository="liangyanlun/edge-office", release_tag="", models_dir=models_dir,
+        model_path=model_path, manifest_path=manifest_path, checksum_path=checksum_path,
+        n_ctx=2048, release_required=True, opener=opener,
+    )
+    result = downloader.install_sync()
+    assert result["verification"] == "sha256sums"
+    assert checksum_path.read_bytes() == checksum_bytes
+
+    adapter = InferenceAdapter(
+        None, model_path=model_path, release_manifest=manifest_path, release_checksum=checksum_path,
+        n_ctx=2048, release_required=True,
+    )  # type: ignore[arg-type]
+    assert adapter._verify_release_manifest()["verification"] == "sha256sums"
+
+
+def test_pinned_release_download_does_not_call_the_rate_limited_github_api(tmp_path: Path):
+    models_dir = tmp_path / "models"
+    model_path = models_dir / "qwen" / "Qwen3.5-0.8B-office.Q8_0.gguf"
+    manifest_path = model_path.with_name("release.manifest.json")
+    checksum_path = model_path.with_name(f"{model_path.stem}.SHA256SUMS.txt")
+    model_bytes = b"pinned-release-gguf"
+    checksum_bytes = f"{hashlib.sha256(model_bytes).hexdigest()}  {model_path.name}\n".encode("utf-8")
+    base = "https://github.com/liangyanlun/edge-office/releases/download/v0.1.0"
+    payloads = {f"{base}/{model_path.name}": model_bytes, f"{base}/{checksum_path.name}": checksum_bytes}
+
+    def opener(request, timeout):
+        assert "/api.github.com/" not in request.full_url
+        return _DownloadResponse(payloads[request.full_url])
+
+    downloader = ModelReleaseDownloader(
+        enabled=True, repository="liangyanlun/edge-office", release_tag="v0.1.0", models_dir=models_dir,
+        model_path=model_path, manifest_path=manifest_path, checksum_path=checksum_path,
+        n_ctx=2048, release_required=True, opener=opener,
+    )
+    assert downloader.install_sync()["verification"] == "sha256sums"
+
+
+def test_model_download_endpoint_rejects_client_supplied_urls(client):
+    response = client.post("/api/v1/model/download", json={"url": "https://example.invalid/model.gguf"})
+    assert response.status_code == 400
+    assert response.get_json()["error"]["code"] == "UNTRUSTED_MODEL_DOWNLOAD_PAYLOAD"
 
 
 def test_faiss_index_can_be_written_under_a_chinese_path(tmp_path: Path):
@@ -66,6 +210,34 @@ def test_faiss_index_can_be_written_under_a_chinese_path(tmp_path: Path):
     )
     assert application.test_client().get("/api/v1/health").status_code == 200
     assert (unicode_root / "索引" / "knowledge.faiss").exists()
+
+
+def test_config_honors_explicit_runtime_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    runtime_root = tmp_path / "edge-office-user-data"
+    monkeypatch.setenv("EDGE_OFFICE_HOME", str(runtime_root))
+    config = default_config()
+    assert config["RUNTIME_DIR"] == runtime_root
+    assert config["DATABASE_PATH"] == runtime_root / "artifacts" / "data" / "edge_office.db"
+    assert config["MODELS_DIR"] == runtime_root / "artifacts" / "models"
+
+
+def test_preferences_are_local_persistent_and_validate_input(client):
+    initial = client.get("/api/v1/preferences")
+    assert initial.status_code == 200
+    assert initial.get_json()["item"]["onboardingComplete"] is False
+
+    saved = client.put("/api/v1/preferences", json={
+        "displayName": "言伦", "role": "科研学习", "writingTone": "concise",
+        "ragEnabled": False, "onboardingComplete": True, "pinnedTools": ["summary"], "lastView": "tools",
+    })
+    assert saved.status_code == 200
+    assert saved.get_json()["item"]["displayName"] == "言伦"
+    assert saved.get_json()["item"]["pinnedTools"] == ["summary"]
+    assert client.get("/api/v1/preferences").get_json()["item"]["lastView"] == "tools"
+
+    invalid = client.put("/api/v1/preferences", json={"writingTone": "anything"})
+    assert invalid.status_code == 400
+    assert invalid.get_json()["error"]["code"] == "INVALID_PREFERENCES"
 
 
 def test_document_import_builds_faiss_and_returns_cited_sse(client):
@@ -95,6 +267,23 @@ def test_agent_lists_documents_and_persists_the_conversation(client):
     assert "项目综述" in payload["answer"]
     conversation = client.get(f"/api/v1/conversations/{payload['conversationId']}").get_json()["item"]
     assert len(conversation["messages"]) == 2
+
+
+def test_chat_can_hide_internal_task_prompt_from_conversation_history(client):
+    response = client.post(
+        "/api/v1/chat/stream",
+        json={
+            "message": "请从本地材料中定位与这个问题最相关的原文，并保留引用依据：项目的核心创新是什么？",
+            "displayMessage": "项目的核心创新是什么？",
+            "ragEnabled": True,
+        },
+    )
+    assert response.status_code == 200
+    body = response.data.decode("utf-8")
+    conversation_id = json.loads(next(line[6:] for line in body.splitlines() if line.startswith("data: ")))["conversationId"]
+    conversation = client.get(f"/api/v1/conversations/{conversation_id}").get_json()["item"]
+    assert conversation["messages"][0]["content"] == "项目的核心创新是什么？"
+    assert "请从本地材料中定位" not in conversation["messages"][0]["content"]
 
 
 def test_rag_persists_provenance_and_atomic_generation(app, client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
