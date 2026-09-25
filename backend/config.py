@@ -32,8 +32,11 @@ def default_config() -> dict[str, object]:
     default_embedding_model = artifacts / "models" / "bge-small-zh-v1.5"
     default_model_dir = artifacts / "models" / "qwen3_5_0p8_office_q8_0"
     default_model_file = default_model_dir / "Qwen3.5-0.8B-office.Q8_0.gguf"
+    four_b_model_dir = artifacts / "models" / "qwen3_5_4b_office_q4_k_m"
+    four_b_model_file = four_b_model_dir / "Qwen3.5-4B-office.Q4_K_M.gguf"
     release_required_default = "false" if getattr(sys, "frozen", False) else "true"
     return {
+        "APP_VERSION": "0.2.0-dev.20260925",
         "ROOT_DIR": ROOT_DIR,
         "RUNTIME_DIR": runtime_root,
         "DATA_DIR": artifacts / "data",
@@ -75,6 +78,19 @@ def default_config() -> dict[str, object]:
         # Pin the public model release so first-run downloads do not depend on
         # GitHub's unauthenticated API quota. Maintainers can still override it.
         "MODEL_RELEASE_TAG": os.getenv("MODEL_RELEASE_TAG", "v0.1.0").strip(),
+        # The 4B Release is intentionally a visible, disabled placeholder until
+        # the GGUF, manifest and checksum have passed the separate 4B/PPT gate.
+        # Enabling this flag later exposes the same fixed-asset downloader without
+        # changing the repository or accepting a browser-provided URL.
+        "MODEL_4B_MODEL_PATH": os.getenv("MODEL_4B_MODEL_PATH", str(four_b_model_file)),
+        "MODEL_4B_RELEASE_MANIFEST": os.getenv(
+            "MODEL_4B_RELEASE_MANIFEST", str(four_b_model_dir / "release.manifest.json")
+        ),
+        "MODEL_4B_RELEASE_CHECKSUM": os.getenv(
+            "MODEL_4B_RELEASE_CHECKSUM", str(four_b_model_dir / f"{four_b_model_file.stem}.SHA256SUMS.txt")
+        ),
+        "MODEL_4B_RELEASE_TAG": os.getenv("MODEL_4B_RELEASE_TAG", "v0.2.0-4b").strip(),
+        "MODEL_4B_DOWNLOAD_ENABLED": os.getenv("MODEL_4B_DOWNLOAD_ENABLED", "false").lower() in {"1", "true", "yes"},
         "MODEL_DOWNLOAD_TIMEOUT_SECONDS": int(os.getenv("MODEL_DOWNLOAD_TIMEOUT_SECONDS", "30")),
         "MODEL_DOWNLOAD_MAX_BYTES": int(os.getenv("MODEL_DOWNLOAD_MAX_BYTES", str(2 * 1024 * 1024 * 1024))),
         "LLAMA_N_CTX": int(os.getenv("LLAMA_N_CTX", "2048")),
@@ -92,5 +108,17 @@ def default_config() -> dict[str, object]:
         "MAX_AGENT_STEPS": 1,
         "AGENT_CONFIRMATION_TTL_SECONDS": int(os.getenv("AGENT_CONFIRMATION_TTL_SECONDS", "300")),
         "AGENT_LOCAL_USER_ID": os.getenv("AGENT_LOCAL_USER_ID", "local-user"),
+        # Schedule parsing is explicit and deterministic; users can override the
+        # default Chinese locale instead of asking the small model to infer a zone.
+        "SCHEDULE_TIMEZONE": os.getenv("EDGE_OFFICE_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai",
+        # Calendar is a preserved internal experiment, not a launch feature.
+        "CALENDAR_EXPERIMENTAL_ENABLED": os.getenv("EDGE_OFFICE_CALENDAR_EXPERIMENTAL", "false").lower() in {"1", "true", "yes"},
+        # Mobile access is opt-in. Keep loopback/local-cookie behavior unchanged
+        # unless an administrator explicitly configures a pairing code.
+        "MOBILE_APP_VERSION": os.getenv("EDGE_OFFICE_APP_VERSION", "0.2.0"),
+        "MOBILE_MODE": os.getenv("EDGE_OFFICE_MODE", "local"),
+        "MOBILE_PAIRING_CODE": os.getenv("EDGE_OFFICE_PAIRING_CODE", "").strip(),
+        "MOBILE_PAIRING_SECRET": os.getenv("EDGE_OFFICE_PAIRING_SECRET", "").strip(),
+        "MOBILE_UPLOAD_CHUNK_BYTES": int(os.getenv("EDGE_OFFICE_UPLOAD_CHUNK_BYTES", str(5 * 1024 * 1024))),
         "TESTING": False,
     }

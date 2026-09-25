@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from io import BytesIO
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 
@@ -15,6 +16,7 @@ from backend.inference import InferenceAdapter
 from backend.model_download import ModelDownloadError, ModelReleaseDownloader
 from backend.parsers import ParseError, parse_upload
 from backend.rag import FaissRagService
+from backend.schedule import ScheduleParseError, parse_schedule_text
 
 
 @pytest.fixture()
@@ -28,6 +30,7 @@ def app(tmp_path: Path):
             "DATABASE_PATH": tmp_path / "data" / "test.db",
             "EMBEDDING_MODEL_PATH": "",
             "LLAMA_CPP_ENABLED": False,
+            "MODEL_4B_DOWNLOAD_ENABLED": False,
             "OCR_ENABLED": False,
             "TESTING": True,
         }
@@ -44,13 +47,29 @@ def test_health_and_faiss_index_are_ready(client, app, tmp_path: Path):
     response = client.get("/api/v1/health")
     assert response.status_code == 200
     assert response.get_json()["status"] == "ok"
+    assert response.get_json()["appVersion"] == "0.2.0-dev.20260925"
     assert (tmp_path / "indexes" / "knowledge.faiss").exists()
     runtime = client.get("/api/v1/runtime/status").get_json()
-    assert runtime["rag"]["chunkCount"] > 0
+    assert runtime["rag"]["chunkCount"] == 0
     assert runtime["rag"]["embedding"]["mode"] == "offline-fallback"
     assert runtime["ingestion"]["formats"] == ["txt", "md", "pdf", "docx", "xlsx", "csv", "pptx", "html"]
     assert runtime["ingestion"]["ocr"]["enabled"] is False
     assert runtime["modelDownload"]["repository"] == "liangyanlun/edge-office"
+    assert runtime["modelDownload"]["modelDirectory"].endswith("qwen3_5_0p8_office_q8_0")
+    models = {item["id"]: item for item in runtime["models"]}
+    assert models["qwen3.5-4b-office"]["releaseTag"] == "v0.2.0-4b"
+    assert models["qwen3.5-4b-office"]["downloadAvailable"] is False
+    assert models["qwen3.5-4b-office"]["status"] == "development"
+
+
+def test_4b_model_entry_is_visible_but_download_is_closed_until_release_ready(client):
+    response = client.get("/api/v1/models")
+    assert response.status_code == 200
+    item = next(model for model in response.get_json()["items"] if model["id"] == "qwen3.5-4b-office")
+    assert item["releaseUrl"].endswith("/releases/tag/v0.2.0-4b")
+    assert client.post("/api/v1/models/qwen3.5-4b-office/download").status_code == 409
+    error = client.post("/api/v1/models/qwen3.5-4b-office/download").get_json()["error"]
+    assert error["code"] == "MODEL_RELEASE_NOT_READY"
 
 
 class _DownloadResponse:
@@ -246,7 +265,7 @@ def test_document_import_builds_faiss_and_returns_cited_sse(client):
         json={"name": "中期检查通知.md", "content": "中期检查材料需要在周五前提交，并附上实验记录和运行截图。"},
     )
     assert imported.status_code == 201
-    assert imported.get_json()["index"]["chunks"] >= 5
+    assert imported.get_json()["index"]["chunks"] >= 1
 
     stream = client.post("/api/v1/chat/stream", json={"message": "中期检查材料什么时候提交？", "ragEnabled": True})
     body = stream.data.decode("utf-8")
@@ -260,11 +279,15 @@ def test_document_import_builds_faiss_and_returns_cited_sse(client):
 
 
 def test_agent_lists_documents_and_persists_the_conversation(client):
+    client.post(
+        "/api/v1/documents",
+        json={"name": "研究材料.md", "content": "本地材料可用于问答、摘要与待办提取。"},
+    )
     response = client.post("/api/v1/agent/runs", json={"message": "有哪些材料可以查看？", "ragEnabled": True})
     assert response.status_code == 200
     payload = response.get_json()
     assert payload["run"]["action"] == "list_documents"
-    assert "项目综述" in payload["answer"]
+    assert "研究材料.md" in payload["answer"]
     conversation = client.get(f"/api/v1/conversations/{payload['conversationId']}").get_json()["item"]
     assert len(conversation["messages"]) == 2
 
@@ -340,7 +363,15 @@ def test_rag_filters_before_scoring_rejects_low_confidence_and_audits(app, clien
     assert public["id"] != internal["id"]
 
 
-def test_rag_injects_at_most_four_blocks_within_frozen_budget(app):
+def test_rag_injects_at_most_four_blocks_within_frozen_budget(app, client):
+    imported = client.post(
+        "/api/v1/documents",
+        json={
+            "name": "项目说明.md",
+            "content": "项目目标是建设轻量办公助手。精准 RAG 用于本地检索与引用。实施路线包含研发、集成和验证。性能指标关注响应与内存。" * 8,
+        },
+    )
+    assert imported.status_code == 201
     rag = app.extensions["rag"]
     evidence = rag.search("项目 目标 RAG 实施路线 性能", top_k=20)
     assert len(evidence) <= 4
@@ -520,6 +551,76 @@ def test_trusted_intent_gate_never_broadens_a_small_model_tool_choice():
     assert AgentOrchestrator.candidate_tools("引用项目目标原文")[0]["name"] == "document_quote"
     draft_schema = AgentOrchestrator.candidate_tools("帮我写一封邮件草稿")[0]["schema"]
     assert set(draft_schema) == {"to", "subject", "body", "tone"}
+
+
+def test_schedule_intent_is_not_sent_to_rag():
+    assert AgentOrchestrator.candidate_tools("明天早上八点开会", calendar_enabled=True)[0]["name"] == "calendar_create_draft"
+    assert AgentOrchestrator.candidate_tools("检查明天日程有没有冲突", calendar_enabled=True)[0]["name"] == "calendar_find_slots"
+    assert AgentOrchestrator.candidate_tools("提交日程", calendar_enabled=True)[0]["name"] == "calendar_commit"
+
+
+def test_calendar_is_not_a_launch_feature_and_meeting_notes_remain_available(client, app):
+    assert "calendar" not in client.get("/api/v1/runtime/status").get_json()
+    tools = {tool["name"] for tool in client.get("/api/v1/agent/tools").get_json()["items"]}
+    assert not tools.intersection({"calendar_create_draft", "calendar_find_slots", "calendar_commit"})
+    assert client.get("/api/v1/calendar/events").status_code == 404
+    assert client.get("/api/v1/calendar/conflicts").status_code == 404
+    response = client.post("/api/v1/agent/runs", json={"message": "明天早上八点开会", "ragEnabled": True})
+    assert response.status_code == 200
+    assert response.get_json()["run"]["tool"] == "respond_without_tool"
+    assert "日历功能未在当前版本开放" in response.get_json()["answer"]
+    assert app.extensions["database"].list_calendar_events() == []
+    assert AgentOrchestrator.candidate_tools("整理会议纪要中的待办和时间节点")[0]["name"] == "document_search"
+
+
+def test_calendar_pending_confirmation_cannot_execute_after_feature_is_disabled(client, app):
+    agent = app.extensions["agent"]
+    agent.calendar_enabled = True
+    plan = client.post("/api/v1/plans", json={"message": "提交日程：明天早上八点开会，时长 60 分钟"}).get_json()["item"]
+    assert plan["tool"] == "calendar_commit"
+    agent.calendar_enabled = False
+    response = client.post(f"/api/v1/plans/{plan['id']}/confirm")
+    assert response.status_code == 409
+    assert response.get_json()["error"]["code"] == "FEATURE_UNAVAILABLE"
+    assert app.extensions["database"].list_calendar_events() == []
+
+
+def test_schedule_parser_normalizes_chinese_time():
+    parsed = parse_schedule_text("明天早上八点开会，时长 90 分钟", now=datetime(2026, 9, 24, 10, tzinfo=timezone(timedelta(hours=8))))
+    assert parsed["title"] == "会议"
+    assert parsed["startAt"] == "2026-09-25T08:00:00+08:00"
+    assert parsed["endAt"] == "2026-09-25T09:30:00+08:00"
+
+
+def test_schedule_missing_time_fails_closed():
+    with pytest.raises(ScheduleParseError):
+        parse_schedule_text("安排项目周会")
+
+
+def test_calendar_conflict_endpoint_and_local_event(client, app):
+    app.config["CALENDAR_EXPERIMENTAL_ENABLED"] = True
+    database = app.extensions["database"]
+    first = database.create_calendar_event(
+        title="项目周会", start_at="2026-09-25T08:00:00+08:00", end_at="2026-09-25T09:00:00+08:00",
+        timezone="Asia/Shanghai", status="confirmed",
+    )
+    second = database.create_calendar_event(
+        title="评审会议", start_at="2026-09-25T08:30:00+08:00", end_at="2026-09-25T09:30:00+08:00",
+        timezone="Asia/Shanghai", status="draft",
+    )
+    assert first["id"] != second["id"]
+    response = client.get("/api/v1/calendar/conflicts?start=2026-09-25T08:00:00%2B08:00&end=2026-09-25T10:00:00%2B08:00")
+    assert response.status_code == 200
+    assert {item["title"] for item in response.get_json()["items"]} == {"项目周会", "评审会议"}
+
+
+def test_calendar_chat_request_creates_deterministic_draft_plan(client, app):
+    app.extensions["agent"].calendar_enabled = True
+    response = client.post("/api/v1/agent/runs", json={"message": "明天早上八点开会，时长 60 分钟", "ragEnabled": True})
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["run"]["tool"] == "calendar_create_draft"
+    assert payload["run"]["plan"]["arguments"]["startAt"].endswith("T08:00:00+08:00")
 
 
 def test_upload_import_parses_csv_html_and_preserves_source_locators(client, app):

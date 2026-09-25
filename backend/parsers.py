@@ -154,6 +154,11 @@ def _validate_ooxml_archive(data: bytes, max_files: int = 5_000, max_expanded_by
         raise ParseError("INVALID_OOXML", "Office 文件结构损坏") from error
 
 
+def validate_ooxml_archive(data: bytes, max_files: int = 5_000, max_expanded_bytes: int = 100 * 1024 * 1024) -> None:
+    """Public preflight shared by read-only ingestion and Office executors."""
+    _validate_ooxml_archive(data, max_files=max_files, max_expanded_bytes=max_expanded_bytes)
+
+
 def _parse_pdf(data: bytes, *, ocr_enabled: bool, max_pages: int, max_ocr_pages: int) -> ParsedDocument:
     reader = PdfReader(io.BytesIO(data))
     if reader.is_encrypted:

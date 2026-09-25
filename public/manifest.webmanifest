@@ -1,0 +1,13 @@
+{
+  "name": "微知 Edge Office",
+  "short_name": "微知",
+  "description": "本地优先的材料理解、RAG 检索与可确认办公助手",
+  "lang": "zh-CN",
+  "start_url": "/?source=pwa",
+  "display": "standalone",
+  "background_color": "#f4f7f5",
+  "theme_color": "#15263a",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

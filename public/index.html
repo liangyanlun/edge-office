@@ -4,6 +4,10 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#15263a" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="manifest" href="/manifest.webmanifest" />
     <title>微知 Edge Office</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
@@ -53,7 +57,7 @@
           <p class="section-kicker">为你准备</p>
           <h2>设置你的工作偏好</h2>
           <form class="profile-form" id="onboarding-profile-form">
-            <label>称呼<input name="displayName" maxlength="40" placeholder="例如：言伦" /></label>
+            <label>称呼<input name="displayName" maxlength="40" placeholder="可选，用于个性化称呼" /></label>
             <label>主要场景<select name="role"><option>科研学习</option><option>项目管理</option><option>行政办公</option><option>材料写作</option></select></label>
             <label>默认表达<select name="writingTone"><option value="professional">正式专业</option><option value="concise">简洁直接</option><option value="natural">自然友好</option></select></label>
             <label class="check-row"><input name="ragEnabled" type="checkbox" checked /> 默认使用本地知识库</label>
@@ -88,6 +92,7 @@
           <button class="nav-item active" type="button" data-view="home"><span aria-hidden="true">⌂</span> 工作台</button>
           <button class="nav-item" type="button" data-view="chat"><span aria-hidden="true">◌</span> 智能对话</button>
           <button class="nav-item" type="button" data-view="knowledge"><span aria-hidden="true">▤</span> 知识库</button>
+          <button class="nav-item" type="button" data-view="ppt"><span aria-hidden="true">▰</span> PPT 编辑</button>
           <button class="nav-item" type="button" data-view="tools"><span aria-hidden="true">◇</span> 全部工具</button>
         </nav>
         <div class="sidebar-spacer"></div>
@@ -102,14 +107,22 @@
           <div><p class="section-kicker" id="view-eyebrow">PERSONAL WORKSPACE</p><h1 id="view-title">工作台</h1></div>
           <div class="topbar-actions">
             <button class="command-button" id="open-command" type="button" title="打开命令菜单"><span aria-hidden="true">/</span> 快速任务</button>
-            <button class="model-download-button hidden" id="model-download-button" type="button" title="从已配置的 GitHub Release 下载本地模型">下载本地模型</button>
+            <div class="model-download-control hidden" id="model-download-control">
+              <button class="model-download-button" id="model-download-button" type="button" title="从已配置的 GitHub Release 下载本地模型">下载本地模型</button>
+              <span class="model-download-location" id="model-download-location"></span>
+            </div>
             <div class="runtime-badge" id="runtime-badge" aria-live="polite"><span class="status-dot"></span><span>本地引擎加载中</span></div>
+            <span class="mobile-mode-badge hidden" id="mobile-mode-badge" aria-live="polite"></span>
           </div>
         </header>
 
         <section class="view active" id="home-view" aria-label="工作台">
           <header class="dashboard-intro"><p class="section-kicker">你的本地工作区</p><h2 id="dashboard-greeting">准备开始今天的工作</h2><p id="dashboard-context">从一个问题、一份材料或一项待处理事务开始。</p></header>
           <div class="workspace-stats" id="workspace-stats" aria-live="polite"></div>
+          <section class="dashboard-section model-center-section" aria-label="模型中心">
+            <div class="section-heading"><div><p class="section-kicker">MODEL CENTER</p><h2>模型中心</h2></div><span class="model-center-note">模型文件保存在本机，不进入源码仓库</span></div>
+            <div class="model-grid" id="model-grid" aria-live="polite"></div>
+          </section>
           <section class="dashboard-section"><div class="section-heading"><div><p class="section-kicker">常用操作</p><h2>开始处理</h2></div><button class="text-button" type="button" data-view="tools">查看全部工具</button></div><div class="task-grid" id="quick-actions"></div></section>
           <section class="dashboard-section recommendation-section" id="recommendation-section"></section>
           <section class="dashboard-section"><div class="section-heading"><div><p class="section-kicker">最近工作</p><h2>继续上次的上下文</h2></div><button class="text-button" type="button" data-view="chat">打开对话</button></div><div class="recent-list" id="recent-conversations"></div></section>
@@ -123,11 +136,39 @@
 
         <section class="view" id="knowledge-view" aria-label="知识库"><div class="knowledge-header"><div><p class="section-kicker">LOCAL KNOWLEDGE BASE</p><h2>知识库材料</h2><p>导入后会建立本地索引，用于后续问答、摘要和对比。</p></div><div><input id="document-file" type="file" accept=".txt,.md,.pdf,.docx,.xlsx,.csv,.pptx,.html,.htm,text/plain,text/markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation,text/csv,text/html" hidden /><button class="primary-button" id="import-button" type="button">导入本地材料</button></div></div><div class="knowledge-summary" id="knowledge-summary"></div><div class="document-list" id="document-list" data-testid="document-list"></div></section>
 
+        <section class="view" id="ppt-view" aria-label="PPT 编辑">
+          <div class="ppt-entrybar">
+            <div><p class="section-kicker">VERSIONED POWERPOINT EDITOR</p><h2>PPT 编辑</h2><p>编辑入口与知识库分离；原文件只读保存，每次确认都会生成新版本。</p></div>
+            <div class="ppt-entry-actions"><select id="ppt-presentation-select" aria-label="选择演示文稿"></select><input id="ppt-file" type="file" accept=".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation" hidden /><button class="primary-button" id="ppt-import-button" type="button">导入 PPTX</button></div>
+          </div>
+          <div class="ppt-model-warning hidden" id="ppt-model-warning" role="status"></div>
+          <div class="ppt-empty" id="ppt-empty"><strong>导入一份 PPTX 开始编辑</strong><span>系统会保存不可覆盖的原件，并为每一页生成稳定对象 ID 与预览。</span></div>
+          <div class="ppt-workspace hidden" id="ppt-workspace">
+            <aside class="ppt-slides-panel"><div class="ppt-panel-title"><span>幻灯片</span><strong id="ppt-slide-count">0</strong></div><div class="ppt-slide-list" id="ppt-slide-list"></div></aside>
+            <section class="ppt-canvas-panel">
+              <div class="ppt-canvas-toolbar"><div><button class="ppt-view-mode active" type="button" data-ppt-mode="before">修改前</button><button class="ppt-view-mode" type="button" data-ppt-mode="after">修改后</button><button class="ppt-view-mode" type="button" data-ppt-mode="compare">并排对比</button></div><span id="ppt-preview-status">选择一页查看预览</span></div>
+              <div class="ppt-preview-stage" id="ppt-preview-stage"><figure class="ppt-preview before"><figcaption>修改前</figcaption><img id="ppt-before-image" alt="修改前幻灯片预览" /></figure><figure class="ppt-preview after hidden"><figcaption>修改后</figcaption><img id="ppt-after-image" alt="修改后幻灯片预览" /></figure></div>
+            </section>
+            <aside class="ppt-task-panel">
+              <div class="ppt-panel-title"><span>修改任务</span><strong id="ppt-version-label">—</strong></div>
+              <label class="ppt-task-field">告诉模型需要如何修改<textarea id="ppt-instruction" maxlength="4000" rows="5" placeholder="例如：把标题改为“2026 年项目总结”，并删除右侧图片"></textarea></label>
+              <div class="ppt-asset-row"><input id="ppt-image-file" type="file" accept="image/png,image/jpeg,image/webp" hidden /><button class="ghost-button" id="ppt-image-button" type="button">上传替换图片</button><span id="ppt-asset-label">未选择图片</span></div>
+              <button class="primary-button ppt-generate-button" id="ppt-generate-button" type="button">生成修改计划与预览</button>
+              <section class="ppt-plan-card hidden" id="ppt-plan-card"><div class="ppt-plan-heading"><div><small>受限操作计划</small><strong id="ppt-plan-title">等待生成</strong></div><span id="ppt-plan-status">—</span></div><dl class="ppt-plan-meta"><div><dt>受影响页</dt><dd id="ppt-plan-slide">—</dd></div><div><dt>操作数量</dt><dd id="ppt-plan-count">—</dd></div><div><dt>基础版本</dt><dd id="ppt-plan-version">—</dd></div><div><dt>计划哈希</dt><dd id="ppt-plan-hash">—</dd></div></dl><ol id="ppt-operation-list" class="ppt-operation-list"></ol><p id="ppt-verification-note" class="ppt-verification-note"></p><div class="ppt-plan-actions"><button class="ghost-button" id="ppt-cancel-button" type="button">取消计划</button><button class="primary-button" id="ppt-confirm-button" type="button">确认并发布新版本</button></div></section>
+              <section class="ppt-complete-card hidden" id="ppt-complete-card"><strong>新版本已发布</strong><p>确认发布使用的是已经预览并验证过的暂存副本，没有重新运行模型。</p><div><button class="ghost-button" id="ppt-download-button" type="button">下载</button><button class="ghost-button" id="ppt-open-button" type="button">在 PowerPoint 中打开</button><button class="ghost-button" id="ppt-undo-button" type="button">撤销为新版本</button></div></section>
+              <section class="ppt-history"><div class="ppt-panel-title"><span>版本历史</span></div><div id="ppt-version-list"></div></section>
+            </aside>
+          </div>
+        </section>
+
         <section class="view" id="tools-view" aria-label="全部工具"><header class="tools-header"><p class="section-kicker">TASK LIBRARY</p><h2>全部工具</h2><p>选择一个任务后，系统会带入合适的对话模板。涉及外部发送、提交或删除的操作仍需要单独确认。</p></header><div class="tool-groups" id="tool-groups"></div></section>
       </main>
     </div>
 
     <div class="modal-layer hidden" id="settings-layer" aria-modal="true" role="dialog" aria-labelledby="settings-title"><section class="settings-dialog"><div class="dialog-heading"><div><p class="section-kicker">PERSONAL PREFERENCES</p><h2 id="settings-title">个人设置</h2></div><button class="icon-button" id="close-settings" type="button" title="关闭">×</button></div><form class="profile-form" id="settings-form"><label>称呼<input name="displayName" maxlength="40" /></label><label>主要场景<select name="role"><option>科研学习</option><option>项目管理</option><option>行政办公</option><option>材料写作</option></select></label><label>默认表达<select name="writingTone"><option value="professional">正式专业</option><option value="concise">简洁直接</option><option value="natural">自然友好</option></select></label><label class="check-row"><input name="ragEnabled" type="checkbox" /> 默认使用本地知识库</label><div class="dialog-actions"><button class="text-button" id="restart-onboarding" type="button">重新查看引导</button><button class="primary-button" type="submit">保存设置</button></div></form></section></div>
+
+    <div class="modal-layer hidden" id="mobile-pair-layer" aria-modal="true" role="dialog" aria-labelledby="mobile-pair-title"><section class="settings-dialog mobile-pair-dialog"><div class="dialog-heading"><div><p class="section-kicker">MOBILE ACCESS</p><h2 id="mobile-pair-title">连接本地工作区</h2></div></div><p class="dialog-helper">请输入电脑端显示的一次性配对码。配对成功后，手机才能访问材料、知识库和 PPT 工作区。</p><form class="profile-form" id="mobile-pair-form"><label>配对码<input name="code" inputmode="numeric" autocomplete="one-time-code" minlength="12" required placeholder="输入配对码" /></label><div class="dialog-actions"><button class="primary-button" type="submit">安全配对</button></div></form></section></div>
+    <div class="modal-layer hidden" id="mobile-server-layer" aria-modal="true" role="dialog" aria-labelledby="mobile-server-title"><section class="settings-dialog mobile-pair-dialog"><div class="dialog-heading"><div><p class="section-kicker">MOBILE BACKEND</p><h2 id="mobile-server-title">连接后端服务</h2></div></div><p class="dialog-helper">这是手机 App 第一次运行。请输入电脑或云端 Edge Office 服务地址，例如 `https://office.example.com`。</p><form class="profile-form" id="mobile-server-form"><label>服务地址<input name="apiBase" type="url" inputmode="url" autocomplete="url" required placeholder="https://..." /></label><div class="dialog-actions"><button class="primary-button" type="submit">连接并继续</button></div></form></section></div>
 
     <div class="modal-layer hidden" id="command-layer" aria-modal="true" role="dialog" aria-labelledby="command-title"><section class="command-dialog"><div class="command-input-wrap"><span aria-hidden="true">/</span><input id="command-input" autocomplete="off" placeholder="搜索任务，例如：总结、邮件、待办" /><button class="icon-button" id="close-command" type="button" title="关闭">×</button></div><h2 class="sr-only" id="command-title">快速任务</h2><div class="command-list" id="command-list"></div></section></div>
     <div class="context-tip hidden" id="context-tip" role="status"><p id="context-tip-text"></p><button class="icon-button" type="button" id="close-context-tip" title="关闭">×</button></div>

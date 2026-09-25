@@ -1,3 +1,5 @@
+import { hideSplash, isNativeApp, shareFile } from "./native-bridge.js";
+
 const TOOL_CATALOG = [
   { id: "summary", group: "阅读与总结", title: "总结材料", detail: "提取重点、结论与下一步", status: "ready", prompt: "请总结本地知识库中最相关的材料，按背景、核心要点、结论和下一步整理。", placeholder: "可补充材料范围或关注重点，直接发送则总结相关材料", hint: "系统会检索本地材料并附上引用依据" },
   { id: "compare", group: "阅读与总结", title: "对比材料", detail: "找出两份材料的差异与共识", status: "ready", prompt: "请对比本地知识库中最近的两份材料，列出共同点、差异和需要确认的内容。", placeholder: "可说明要对比的材料或关注维度", hint: "系统会从本地材料中提取共识、差异和待确认项" },
@@ -7,31 +9,101 @@ const TOOL_CATALOG = [
   { id: "outline", group: "写作与沟通", title: "生成汇报提纲", detail: "把材料整理为可讲述的结构", status: "ready", prompt: "请根据本地材料生成一个汇报提纲，包含标题、核心论点和每页建议内容。", placeholder: "可补充汇报对象、时长或重点", hint: "系统会结合本地材料生成可编辑提纲" },
   { id: "minutes", group: "任务与规划", title: "整理会议纪要", detail: "提炼结论、待办和负责人", status: "ready", prompt: "请将以下会议内容整理为会议纪要，分为结论、待办、负责人和时间节点：", placeholder: "粘贴会议记录或补充会议主题", hint: "系统会整理结论、待办、负责人和时间节点" },
   { id: "tasks", group: "任务与规划", title: "提取待办", detail: "从材料或文本识别可执行事项", status: "ready", prompt: "请从本地材料中提取待办事项，按事项、负责人、截止时间和依据列出。", placeholder: "可补充材料范围或直接发送", hint: "系统会提取事项、负责人、截止时间和依据" },
-  { id: "calendar", group: "任务与规划", title: "创建日程草稿", detail: "生成待确认的日程安排", status: "draft", prompt: "请创建一个日程草稿。时间、参与人或主题不完整时先向我确认。", placeholder: "说明主题、时间、参与人和地点", hint: "先生成日程草稿，确认后才能执行外部操作" },
   { id: "import", group: "知识库", title: "导入本地材料", detail: "支持文档、表格、演示文稿与网页", status: "ready", prompt: "" },
+  { id: "ppt", group: "演示文稿", title: "编辑 PPT", detail: "五类受限操作、预览确认与版本撤销", status: "ready", prompt: "" },
 ];
 
 const TOOL_STATUS = { ready: "可直接使用", draft: "草稿后确认" };
-const state = { conversationId: null, ragEnabled: true, controller: null, citations: [], profile: null, documents: [], conversations: [], onboardingStep: 0, activeToolId: null, modelDownload: null, modelDownloadTimer: null };
+const state = { conversationId: null, ragEnabled: true, controller: null, citations: [], profile: null, documents: [], conversations: [], onboardingStep: 0, activeToolId: null, modelDownload: null, modelDownloadTimer: null, modelCatalogTimer: null, models: [], mobile: null, ppt: { presentations: [], current: null, versionId: null, slides: [], slideId: null, asset: null, patch: null, publishedVersionId: null, undoVersionId: null, mode: "before" } };
+function storedApiBase() {
+  try { return String(globalThis.__EDGE_OFFICE_API_BASE__ || globalThis.localStorage?.getItem("edge_office_api_base") || "").trim().replace(/\/+$/, ""); } catch { return ""; }
+}
+function apiBase() {
+  const stored = storedApiBase();
+  if (stored) return stored;
+  if (isNativeApp() && /^https?:$/.test(window.location.protocol) && !/localhost|127\.0\.0\.1/.test(window.location.hostname)) return window.location.origin;
+  return "";
+}
+function apiPath(path) { return /^https?:\/\//i.test(path) ? path : `${apiBase()}${path}`; }
 const elements = {
   splash: document.querySelector("#app-splash"), splashStatus: document.querySelector("#splash-status"), onboarding: document.querySelector("#onboarding-layer"), onboardingProgress: document.querySelector("#onboarding-progress"), onboardingForm: document.querySelector("#onboarding-profile-form"),
-  nav: document.querySelectorAll(".nav-item"), views: document.querySelectorAll(".view"), viewTitle: document.querySelector("#view-title"), viewEyebrow: document.querySelector("#view-eyebrow"), profileLabel: document.querySelector("#profile-label"), sidebarStatus: document.querySelector("#sidebar-service-status"), runtimeBadge: document.querySelector("#runtime-badge span:last-child"), modelDownloadButton: document.querySelector("#model-download-button"),
-  dashboardGreeting: document.querySelector("#dashboard-greeting"), dashboardContext: document.querySelector("#dashboard-context"), workspaceStats: document.querySelector("#workspace-stats"), quickActions: document.querySelector("#quick-actions"), recommendations: document.querySelector("#recommendation-section"), recentConversations: document.querySelector("#recent-conversations"),
+  nav: document.querySelectorAll(".nav-item"), views: document.querySelectorAll(".view"), viewTitle: document.querySelector("#view-title"), viewEyebrow: document.querySelector("#view-eyebrow"), profileLabel: document.querySelector("#profile-label"), sidebarStatus: document.querySelector("#sidebar-service-status"), runtimeBadge: document.querySelector("#runtime-badge span:last-child"), modelDownloadControl: document.querySelector("#model-download-control"), modelDownloadButton: document.querySelector("#model-download-button"), modelDownloadLocation: document.querySelector("#model-download-location"),
+  dashboardGreeting: document.querySelector("#dashboard-greeting"), dashboardContext: document.querySelector("#dashboard-context"), workspaceStats: document.querySelector("#workspace-stats"), modelGrid: document.querySelector("#model-grid"), quickActions: document.querySelector("#quick-actions"), recommendations: document.querySelector("#recommendation-section"), recentConversations: document.querySelector("#recent-conversations"),
   messages: document.querySelector("#messages"), chatPanel: document.querySelector(".chat-panel"), contextActions: document.querySelector("#context-actions"), form: document.querySelector("#chat-form"), input: document.querySelector("#chat-input"), activeToolHint: document.querySelector("#active-tool-hint"), activeToolTitle: document.querySelector("#active-tool-title"), activeToolDetail: document.querySelector("#active-tool-detail"), clearActiveTool: document.querySelector("#clear-active-tool"), ragToggle: document.querySelector("#rag-toggle"), ragLabel: document.querySelector("#rag-label"), stop: document.querySelector("#stop-button"), send: document.querySelector("#send-button"), conversations: document.querySelector("#conversation-list"), newChat: document.querySelector("#new-chat-button"),
   evidence: document.querySelector("#evidence-list"), evidenceCount: document.querySelector("#evidence-count"), ttft: document.querySelector("#metric-ttft"), retrieval: document.querySelector("#metric-retrieval"), speed: document.querySelector("#metric-speed"), memory: document.querySelector("#metric-memory"),
   documentFile: document.querySelector("#document-file"), importButton: document.querySelector("#import-button"), documentList: document.querySelector("#document-list"), knowledgeSummary: document.querySelector("#knowledge-summary"), tools: document.querySelector("#tool-groups"),
-  settingsLayer: document.querySelector("#settings-layer"), settingsForm: document.querySelector("#settings-form"), commandLayer: document.querySelector("#command-layer"), commandInput: document.querySelector("#command-input"), commandList: document.querySelector("#command-list"), insightTabs: document.querySelectorAll(".insight-tab"), insightContents: document.querySelectorAll(".insight-content"), contextTip: document.querySelector("#context-tip"), contextTipText: document.querySelector("#context-tip-text"), toast: document.querySelector("#toast"),
+  pptFile: document.querySelector("#ppt-file"), pptImport: document.querySelector("#ppt-import-button"), pptSelect: document.querySelector("#ppt-presentation-select"), pptWarning: document.querySelector("#ppt-model-warning"), pptEmpty: document.querySelector("#ppt-empty"), pptWorkspace: document.querySelector("#ppt-workspace"), pptSlideCount: document.querySelector("#ppt-slide-count"), pptSlideList: document.querySelector("#ppt-slide-list"), pptVersionLabel: document.querySelector("#ppt-version-label"), pptBefore: document.querySelector("#ppt-before-image"), pptAfter: document.querySelector("#ppt-after-image"), pptPreviewStatus: document.querySelector("#ppt-preview-status"), pptStage: document.querySelector("#ppt-preview-stage"), pptInstruction: document.querySelector("#ppt-instruction"), pptImageFile: document.querySelector("#ppt-image-file"), pptImageButton: document.querySelector("#ppt-image-button"), pptAssetLabel: document.querySelector("#ppt-asset-label"), pptGenerate: document.querySelector("#ppt-generate-button"), pptPlanCard: document.querySelector("#ppt-plan-card"), pptPlanTitle: document.querySelector("#ppt-plan-title"), pptPlanStatus: document.querySelector("#ppt-plan-status"), pptPlanSlide: document.querySelector("#ppt-plan-slide"), pptPlanCount: document.querySelector("#ppt-plan-count"), pptPlanVersion: document.querySelector("#ppt-plan-version"), pptPlanHash: document.querySelector("#ppt-plan-hash"), pptOperations: document.querySelector("#ppt-operation-list"), pptVerification: document.querySelector("#ppt-verification-note"), pptConfirm: document.querySelector("#ppt-confirm-button"), pptCancel: document.querySelector("#ppt-cancel-button"), pptComplete: document.querySelector("#ppt-complete-card"), pptDownload: document.querySelector("#ppt-download-button"), pptOpen: document.querySelector("#ppt-open-button"), pptUndo: document.querySelector("#ppt-undo-button"), pptVersionList: document.querySelector("#ppt-version-list"), pptModes: document.querySelectorAll(".ppt-view-mode"),
+  settingsLayer: document.querySelector("#settings-layer"), settingsForm: document.querySelector("#settings-form"), commandLayer: document.querySelector("#command-layer"), commandInput: document.querySelector("#command-input"), commandList: document.querySelector("#command-list"), insightTabs: document.querySelectorAll(".insight-tab"), insightContents: document.querySelectorAll(".insight-content"), contextTip: document.querySelector("#context-tip"), contextTipText: document.querySelector("#context-tip-text"), toast: document.querySelector("#toast"), mobileModeBadge: document.querySelector("#mobile-mode-badge"), mobilePairLayer: document.querySelector("#mobile-pair-layer"), mobilePairForm: document.querySelector("#mobile-pair-form"), mobileServerLayer: document.querySelector("#mobile-server-layer"), mobileServerForm: document.querySelector("#mobile-server-form"),
 };
 
 async function request(path, options = {}) {
-  const response = await fetch(path, options);
+  const response = await fetch(apiPath(path), options);
   if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error?.message || "请求失败，请稍后重试"); }
   return response.json();
+}
+async function ensureNativeServerAddress() {
+  if (!isNativeApp() || apiBase()) return true;
+  elements.mobileServerLayer.classList.remove("hidden");
+  elements.mobileServerForm.elements.apiBase.focus();
+  return new Promise((resolve) => {
+    const submit = (event) => {
+      event.preventDefault();
+      const value = elements.mobileServerForm.elements.apiBase.value.trim().replace(/\/+$/, "");
+      if (!/^https?:\/\//i.test(value)) return showToast("服务地址必须以 http:// 或 https:// 开头");
+      try { globalThis.localStorage?.setItem("edge_office_api_base", value); } catch { /* native storage can be unavailable in restricted mode */ }
+      elements.mobileServerLayer.classList.add("hidden");
+      elements.mobileServerForm.removeEventListener("submit", submit);
+      resolve(true);
+      window.setTimeout(() => window.location.reload(), 30);
+    };
+    elements.mobileServerForm.addEventListener("submit", submit);
+  });
 }
 function showToast(message) { elements.toast.textContent = message; elements.toast.classList.remove("hidden"); window.clearTimeout(showToast.timeout); showToast.timeout = window.setTimeout(() => elements.toast.classList.add("hidden"), 2600); }
 function firstName() { return state.profile?.displayName || "你"; }
 function setSplashStatus(message) { elements.splashStatus.textContent = message; }
 function completeSplash() { window.setTimeout(() => { document.body.classList.remove("booting"); elements.splash.classList.add("leaving"); window.setTimeout(() => elements.splash.remove(), 520); }, 360); }
+async function refreshMobileBootstrap() {
+  try {
+    const payload = await request("/api/v1/mobile/bootstrap");
+    state.mobile = payload;
+    if (payload.mode !== "local" || payload.pairingRequired) {
+      elements.mobileModeBadge.textContent = payload.paired ? `手机模式 · ${payload.mode}` : `手机配对 · ${payload.mode}`;
+      elements.mobileModeBadge.classList.remove("hidden");
+    }
+    if (payload.model?.pptRecommended === false && payload.model?.pptWarning) {
+      elements.pptWarning.textContent = payload.model.pptWarning;
+    }
+    return payload;
+  } catch { /* Older local instances can continue without the mobile capability API. */ }
+}
+async function ensureMobilePairing(payload) {
+  if (!payload?.pairingRequired || payload.paired) return true;
+  elements.mobilePairLayer.classList.remove("hidden");
+  elements.mobilePairForm.elements.code.focus();
+  return new Promise((resolve) => {
+    const submit = async (event) => {
+      event.preventDefault();
+      const button = elements.mobilePairForm.querySelector("button[type=submit]");
+      button.disabled = true;
+      try {
+        await request("/api/v1/mobile/pair", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code: elements.mobilePairForm.elements.code.value.trim() }) });
+        elements.mobilePairLayer.classList.add("hidden");
+        elements.mobilePairForm.removeEventListener("submit", submit);
+        await refreshMobileBootstrap();
+        showToast("手机已安全配对");
+        resolve(true);
+      } catch (error) {
+        showToast(error.message);
+        button.disabled = false;
+      }
+    };
+    elements.mobilePairForm.addEventListener("submit", submit);
+  });
+}
+function registerAppShell() {
+  if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
+}
 
 function populateProfileForm(form, profile) {
   if (!form || !profile) return;
@@ -99,6 +171,7 @@ function composeToolRequest(tool, userInput) {
 function useTool(id) {
   const tool = toolById(id); if (!tool) return; closeCommand();
   if (tool.id === "import") { switchView("knowledge"); window.setTimeout(() => elements.importButton.click(), 180); return; }
+  if (tool.id === "ppt") { switchView("ppt"); return; }
   if ((tool.id === "summary" && !state.documents.length) || (tool.id === "compare" && state.documents.length < 2)) { switchView("knowledge"); showToast(toolPrompt(tool)); return; }
   switchView("chat"); setActiveTool(tool); elements.input.focus();
 }
@@ -128,6 +201,61 @@ function renderDashboard() {
   elements.recentConversations.replaceChildren();
   if (!state.conversations.length) { const empty = document.createElement("p"); empty.className = "empty-inline"; empty.textContent = "还没有对话记录。可以从一个材料问题或快捷任务开始。"; elements.recentConversations.append(empty); return; }
   state.conversations.slice(0, 4).forEach((conversation) => { const button = document.createElement("button"); button.type = "button"; button.className = "recent-item"; button.dataset.conversation = conversation.id; const title = document.createElement("strong"); title.textContent = conversation.title; const note = document.createElement("span"); note.textContent = `${conversation.messageCount || 0} 条消息`; button.append(title, note); elements.recentConversations.append(button); });
+}
+
+function stopModelCatalogPolling() {
+  if (!state.modelCatalogTimer) return;
+  window.clearInterval(state.modelCatalogTimer);
+  state.modelCatalogTimer = null;
+}
+
+function modelStatusLabel(model) {
+  if (model.active) return "当前使用";
+  if (model.downloadState === "downloading") return "正在下载";
+  if (model.installed) return model.verified ? "已下载 · 待启用" : "已下载 · 待校验";
+  if (model.status === "development") return "开发中";
+  return "可下载";
+}
+
+function renderModelCatalog(models = []) {
+  state.models = Array.isArray(models) ? models : [];
+  if (!elements.modelGrid) return;
+  elements.modelGrid.replaceChildren();
+  if (!state.models.length) {
+    const empty = document.createElement("p"); empty.className = "empty-inline"; empty.textContent = "模型信息暂不可用"; elements.modelGrid.append(empty); stopModelCatalogPolling(); return;
+  }
+  let downloading = false;
+  state.models.forEach((model) => {
+    downloading ||= model.downloadState === "downloading";
+    const card = document.createElement("article"); card.className = `model-card ${model.id === "qwen3.5-4b-office" ? "model-card-featured" : ""}`;
+    const head = document.createElement("div"); head.className = "model-card-head";
+    const copy = document.createElement("div"); const title = document.createElement("strong"); title.textContent = model.name; const subtitle = document.createElement("span"); subtitle.textContent = `${model.parameterBillions}B · ${model.quantization}`; copy.append(title, subtitle);
+    const badge = document.createElement("span"); badge.className = `model-badge ${model.active ? "active" : model.status === "development" ? "planned" : ""}`; badge.textContent = modelStatusLabel(model); head.append(copy, badge);
+    const message = document.createElement("p"); message.className = "model-card-message"; message.textContent = model.message || "";
+    const meta = document.createElement("small"); meta.className = "model-card-meta"; meta.textContent = `Release ${model.releaseTag} · 保存到 ${model.modelDirectory || "本机应用数据目录"}`;
+    const actions = document.createElement("div"); actions.className = "model-card-actions";
+    const download = document.createElement("button"); download.type = "button"; download.className = "primary-button"; download.dataset.modelDownload = model.id;
+    if (model.downloadState === "downloading") { const progress = Number.isFinite(Number(model.download?.progressPercent)) ? ` ${Math.floor(Number(model.download.progressPercent))}%` : ""; download.textContent = `正在下载${progress}`; download.disabled = true; }
+    else if (model.downloadAvailable && !model.installed) download.textContent = model.id === "qwen3.5-4b-office" ? "下载 4B 模型" : "下载模型";
+    else if (model.installed) { download.textContent = model.active ? "当前使用中" : "已下载，待启用"; download.disabled = true; }
+    else { download.textContent = "模型开发中"; download.disabled = true; }
+    actions.append(download);
+    const release = document.createElement("a"); release.className = "ghost-button model-release-link"; release.href = model.releaseUrl; release.target = "_blank"; release.rel = "noreferrer"; release.textContent = model.status === "development" ? "查看开发说明" : "查看 Release"; actions.append(release);
+    card.append(head, message, meta, actions); elements.modelGrid.append(card);
+  });
+  if (downloading && !state.modelCatalogTimer) state.modelCatalogTimer = window.setInterval(() => refreshRuntime().catch(() => {}), 900);
+  if (!downloading) stopModelCatalogPolling();
+}
+
+async function startModelProfileDownload(modelId) {
+  const model = state.models.find((item) => item.id === modelId);
+  if (!model) return;
+  if (!model.downloadAvailable) { showToast(model.message || "该模型暂未开放下载"); return; }
+  try {
+    const payload = await request(`/api/v1/models/${encodeURIComponent(modelId)}/download`, { method: "POST" });
+    showToast(`已开始下载 ${model.name}，将保存到本机模型目录`);
+    renderModelCatalog(state.models.map((item) => item.id === modelId ? { ...item, downloadState: payload.item.state, download: payload.item } : item));
+  } catch (error) { showToast(error.message); }
 }
 
 function renderWelcome() {
@@ -170,12 +298,15 @@ function stopModelDownloadPolling() {
 }
 function renderModelDownload(download, model) {
   state.modelDownload = download || null;
-  if (!download?.enabled) { elements.modelDownloadButton.classList.add("hidden"); stopModelDownloadPolling(); return; }
+  if (!download?.enabled) { elements.modelDownloadControl.classList.add("hidden"); stopModelDownloadPolling(); return; }
   const downloading = download.state === "downloading";
   const modelUnavailable = model?.status === "llama-cpp-unavailable";
   const shouldShow = downloading || !download.modelInstalled || modelUnavailable || download.state === "failed";
-  elements.modelDownloadButton.classList.toggle("hidden", !shouldShow);
+  elements.modelDownloadControl.classList.toggle("hidden", !shouldShow);
   if (!shouldShow) { stopModelDownloadPolling(); return; }
+  const location = download.modelDirectory || "本机应用数据目录";
+  elements.modelDownloadLocation.textContent = `保存到：${location}`;
+  elements.modelDownloadLocation.title = location;
   elements.modelDownloadButton.disabled = downloading;
   if (downloading) {
     const progress = Number.isFinite(Number(download.progressPercent)) ? ` ${Math.floor(Number(download.progressPercent))}%` : "";
@@ -185,7 +316,7 @@ function renderModelDownload(download, model) {
   } else {
     elements.modelDownloadButton.textContent = "下载本地模型";
   }
-  elements.modelDownloadButton.title = download.error || "从已配置的 GitHub Release 下载并校验本地 GGUF 模型";
+  elements.modelDownloadButton.title = download.error || `下载并校验本地 GGUF 模型，保存到：${location}`;
   if (downloading && !state.modelDownloadTimer) {
     state.modelDownloadTimer = window.setInterval(() => refreshRuntime().catch(() => {}), 900);
   }
@@ -196,12 +327,13 @@ async function refreshRuntime() {
   elements.sidebarStatus.textContent = health.status === "ok" ? "服务正常 · 本机运行" : "服务异常";
   elements.runtimeBadge.textContent = `${runtime.model.name} · ${runtime.resources.rssMb} MB`;
   renderModelDownload(runtime.modelDownload, runtime.model);
+  renderModelCatalog(runtime.models || []);
 }
 async function startModelDownload() {
   try {
     const payload = await request("/api/v1/model/download", { method: "POST" });
     renderModelDownload(payload.item, null);
-    showToast("已开始下载本地模型，完成后会自动安装");
+    showToast(`已开始下载模型，将保存到：${payload.item.modelDirectory || "本机应用数据目录"}`);
   } catch (error) {
     showToast(error.message);
   }
@@ -224,7 +356,7 @@ function parseSseChunk(buffer, onEvent) {
 async function sendMessage(question, requestMessage = question) {
   addMessage("user", question); const assistant = addMessage("assistant", "", { meta: "准备中" }); assistant.body.classList.add("typing"); assistant.body.textContent = "正在规划本地任务"; updateEvidence([]); resetMetrics(); setGenerating(true); state.controller = new AbortController(); let answer = "";
   try {
-    const response = await fetch("/api/v1/chat/stream", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ conversationId: state.conversationId, message: requestMessage, displayMessage: question, ragEnabled: state.ragEnabled }), signal: state.controller.signal });
+    const response = await fetch(apiPath("/api/v1/chat/stream"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ conversationId: state.conversationId, message: requestMessage, displayMessage: question, ragEnabled: state.ragEnabled }), signal: state.controller.signal });
     if (!response.ok || !response.body) throw new Error("无法建立流式回答连接");
     const reader = response.body.pipeThrough(new TextDecoderStream()).getReader(); let buffer = "";
     const handleEvent = (event, data) => {
@@ -259,11 +391,84 @@ async function refreshDocuments() {
   });
   renderDashboard(); renderWelcome(); renderContextActions();
 }
+
+function pptPreviewUrl(presentationId, versionId, slideId) {
+  return apiPath(`/api/v1/presentations/${encodeURIComponent(presentationId)}/versions/${encodeURIComponent(versionId)}/slides/${encodeURIComponent(slideId)}/preview`);
+}
+function renderPptCapability(capability) {
+  const warning = capability?.warning;
+  elements.pptWarning.classList.toggle("hidden", !warning);
+  elements.pptWarning.textContent = warning || "";
+}
+async function refreshPresentations(preferredId = null) {
+  const payload = await request("/api/v1/presentations");
+  state.ppt.presentations = payload.items || [];
+  renderPptCapability(payload.runtime?.capability);
+  elements.pptSelect.replaceChildren();
+  const placeholder = document.createElement("option"); placeholder.value = ""; placeholder.textContent = state.ppt.presentations.length ? "选择演示文稿" : "尚未导入 PPTX"; elements.pptSelect.append(placeholder);
+  state.ppt.presentations.forEach((item) => { const option = document.createElement("option"); option.value = item.id; option.textContent = `${item.name} · ${item.versionCount} 个版本`; elements.pptSelect.append(option); });
+  const target = preferredId || state.ppt.current?.id || state.ppt.presentations[0]?.id;
+  if (target && state.ppt.presentations.some((item) => item.id === target)) { elements.pptSelect.value = target; await loadPptPresentation(target); }
+  else { state.ppt.current = null; elements.pptEmpty.classList.remove("hidden"); elements.pptWorkspace.classList.add("hidden"); }
+}
+async function loadPptPresentation(id) {
+  const [detail, slides] = await Promise.all([request(`/api/v1/presentations/${encodeURIComponent(id)}`), request(`/api/v1/presentations/${encodeURIComponent(id)}/slides`)]);
+  state.ppt.current = detail.item; state.ppt.versionId = slides.versionId; state.ppt.slides = slides.items || []; state.ppt.slideId = state.ppt.slides[0]?.slideId || null; state.ppt.patch = null; state.ppt.publishedVersionId = null;
+  renderPptCapability(detail.item.modelCapability); elements.pptEmpty.classList.add("hidden"); elements.pptWorkspace.classList.remove("hidden"); elements.pptVersionLabel.textContent = shortId(state.ppt.versionId); elements.pptSlideCount.textContent = String(state.ppt.slides.length); elements.pptPlanCard.classList.add("hidden"); elements.pptComplete.classList.add("hidden");
+  renderPptSlides(); renderPptVersions(); if (state.ppt.slideId) selectPptSlide(state.ppt.slideId);
+}
+function renderPptSlides() {
+  elements.pptSlideList.replaceChildren();
+  state.ppt.slides.forEach((slide) => { const button = document.createElement("button"); button.type = "button"; button.className = `ppt-slide-thumb ${slide.slideId === state.ppt.slideId ? "active" : ""}`; button.dataset.slideId = slide.slideId; const image = document.createElement("img"); image.alt = `第 ${slide.slideNumber} 页`; image.src = pptPreviewUrl(state.ppt.current.id, state.ppt.versionId, slide.slideId); const label = document.createElement("span"); label.textContent = `${slide.slideNumber}`; button.append(image, label); button.addEventListener("click", () => selectPptSlide(slide.slideId)); elements.pptSlideList.append(button); });
+}
+function selectPptSlide(slideId) {
+  state.ppt.slideId = slideId; state.ppt.mode = "before"; elements.pptSlideList.querySelectorAll(".ppt-slide-thumb").forEach((button) => button.classList.toggle("active", button.dataset.slideId === slideId)); elements.pptBefore.src = pptPreviewUrl(state.ppt.current.id, state.ppt.versionId, slideId); elements.pptAfter.removeAttribute("src"); elements.pptPreviewStatus.textContent = `${slideId.replace("slide-", "第 ")} 页 · ${shortId(state.ppt.versionId)}`; setPptMode("before");
+}
+function setPptMode(mode) {
+  state.ppt.mode = mode; elements.pptModes.forEach((button) => button.classList.toggle("active", button.dataset.pptMode === mode)); elements.pptStage.classList.toggle("compare", mode === "compare"); elements.pptStage.querySelector(".before").classList.toggle("hidden", mode === "after"); elements.pptStage.querySelector(".after").classList.toggle("hidden", mode === "before");
+}
+function renderPptVersions() {
+  elements.pptVersionList.replaceChildren();
+  (state.ppt.current?.versions || []).forEach((version) => { const row = document.createElement("div"); row.className = `ppt-version-item ${version.id === state.ppt.current.currentVersionId ? "current" : ""}`; const copy = document.createElement("span"); copy.innerHTML = `<strong>${version.sourceKind === "import" ? "原始导入" : version.sourceKind === "restore" ? "恢复版本" : "编辑版本"}</strong><small>${shortId(version.id)}</small>`; const link = document.createElement("a"); link.href = apiPath(`/api/v1/presentations/${encodeURIComponent(state.ppt.current.id)}/versions/${encodeURIComponent(version.id)}/download`); link.textContent = "下载"; row.append(copy, link); elements.pptVersionList.append(row); });
+}
+async function uploadPptAsset(file) {
+  const form = new FormData(); form.append("file", file, file.name); const response = await fetch(apiPath(`/api/v1/presentations/${encodeURIComponent(state.ppt.current.id)}/assets`), { method: "POST", body: form }); if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error?.message || "图片上传失败"); } const payload = await response.json(); state.ppt.asset = payload.item; elements.pptAssetLabel.textContent = `${payload.item.name} · 已隔离为 ${payload.item.uri}`; return payload.item;
+}
+async function generatePptPatch() {
+  if (!state.ppt.current || !state.ppt.slideId) return showToast("请先导入并选择一页 PPT");
+  const instruction = elements.pptInstruction.value.trim(); if (!instruction) return showToast("请输入修改要求");
+  elements.pptGenerate.disabled = true; elements.pptGenerate.textContent = "正在生成并验证预览"; elements.pptComplete.classList.add("hidden");
+  try {
+    const created = await request(`/api/v1/presentations/${encodeURIComponent(state.ppt.current.id)}/patches`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ baseVersion: state.ppt.versionId, slideId: state.ppt.slideId, instruction }) });
+    const simulated = await request(`/api/v1/ppt-patches/${encodeURIComponent(created.item.id)}/simulate`, { method: "POST" }); state.ppt.patch = simulated.item; renderPptPatch(simulated.item); elements.pptAfter.src = apiPath(`/api/v1/ppt-patches/${encodeURIComponent(simulated.item.id)}/slides/${encodeURIComponent(state.ppt.slideId)}/preview?t=${Date.now()}`); setPptMode("compare"); showToast("修改预览已生成，请核对后确认");
+  } catch (error) { showToast(error.message); }
+  finally { elements.pptGenerate.disabled = false; elements.pptGenerate.textContent = "生成修改计划与预览"; }
+}
+function renderPptPatch(patch) {
+  elements.pptPlanCard.classList.remove("hidden"); elements.pptPlanTitle.textContent = patch.model || "PPT 专用计划器"; elements.pptPlanStatus.textContent = patch.status === "PREVIEW_READY" ? "已验证" : patch.status; elements.pptPlanSlide.textContent = patch.slideId; elements.pptPlanCount.textContent = `${patch.operations.length} 项`; elements.pptPlanVersion.textContent = shortId(patch.baseVersion); elements.pptPlanHash.textContent = patch.patchHash.slice(0, 12); elements.pptOperations.replaceChildren(); patch.operations.forEach((operation) => { const item = document.createElement("li"); item.textContent = describePptOperation(operation); elements.pptOperations.append(item); }); const verification = patch.verification || {}; elements.pptVerification.textContent = verification.ok ? `已重新打开文件并验证；${verification.nonTargetSlidesVerified || 0} 张非目标页未改变。预览方式：${verification.render?.mode || "本地渲染"}${verification.render?.approximate ? "（近似布局）" : ""}。` : "尚未完成验证"; elements.pptConfirm.disabled = !patch.previewReady;
+}
+function describePptOperation(item) { const labels = { replace_paragraph: "替换段落", clone_paragraph: "克隆段落", del_paragraph: "删除段落", replace_image: "替换图片", del_image: "删除图片" }; const target = item.div_id != null ? `文本框 ${item.div_id} / 段落 ${item.paragraph_id}` : `图片 ${item.image_id}`; return `${labels[item.operation] || item.operation} · ${target}`; }
+async function confirmPptPatch() {
+  if (!state.ppt.patch) return; elements.pptConfirm.disabled = true;
+  try { const previousVersion = state.ppt.patch.baseVersion; const presentationId = state.ppt.current.id; const result = await request(`/api/v1/ppt-patches/${encodeURIComponent(state.ppt.patch.id)}/confirm`, { method: "POST" }); await refreshPresentations(presentationId); state.ppt.publishedVersionId = result.version.id; state.ppt.undoVersionId = previousVersion; state.ppt.patch = result.patch; elements.pptPlanCard.classList.add("hidden"); elements.pptComplete.classList.remove("hidden"); showToast("已发布为新版本，原文件未被覆盖"); } catch (error) { showToast(error.message); } finally { elements.pptConfirm.disabled = false; }
+}
+async function cancelPptPatch() { if (!state.ppt.patch) return; try { await request(`/api/v1/ppt-patches/${encodeURIComponent(state.ppt.patch.id)}/cancel`, { method: "POST" }); state.ppt.patch = null; elements.pptPlanCard.classList.add("hidden"); setPptMode("before"); showToast("修改计划已取消"); } catch (error) { showToast(error.message); } }
+function currentPptDownloadUrl(versionId = state.ppt.publishedVersionId || state.ppt.versionId) { return apiPath(`/api/v1/presentations/${encodeURIComponent(state.ppt.current.id)}/versions/${encodeURIComponent(versionId)}/download`); }
+async function downloadCurrentPpt() {
+  const url = currentPptDownloadUrl();
+  if (isNativeApp()) {
+    try { if (await shareFile(url, "微知 Edge Office PPT")) return; } catch (error) { showToast(error.message || "系统分享不可用"); }
+  }
+  const link = document.createElement("a"); link.href = url; link.click();
+}
+function openCurrentPpt() { const url = currentPptDownloadUrl(); const absolute = /^https?:\/\//i.test(url) ? url : new URL(url, window.location.origin).href; window.location.href = `ms-powerpoint:ofe|u|${absolute}`; window.setTimeout(() => showToast("若 PowerPoint 未打开，请使用“下载”后双击文件"), 800); }
+async function undoPptVersion() { const baseVersion = state.ppt.undoVersionId || state.ppt.patch?.baseVersion || state.ppt.current?.versions?.[1]?.id; if (!baseVersion) return showToast("没有可恢复的上一版本"); try { await request(`/api/v1/presentations/${encodeURIComponent(state.ppt.current.id)}/versions/${encodeURIComponent(baseVersion)}/restore`, { method: "POST" }); await refreshPresentations(state.ppt.current.id); state.ppt.undoVersionId = null; elements.pptComplete.classList.add("hidden"); showToast("已将旧版本复制为新的当前版本"); } catch (error) { showToast(error.message); } }
+function shortId(value) { const text = String(value || "—"); return text.length > 22 ? `${text.slice(0, 10)}…${text.slice(-8)}` : text; }
 function switchView(viewName, options = {}) {
-  const metadata = { home: ["工作台", "PERSONAL WORKSPACE"], chat: ["智能对话", "LOCAL AGENT"], knowledge: ["知识库", "LOCAL KNOWLEDGE BASE"], tools: ["全部工具", "TASK LIBRARY"] };
+  const metadata = { home: ["工作台", "PERSONAL WORKSPACE"], chat: ["智能对话", "LOCAL AGENT"], knowledge: ["知识库", "LOCAL KNOWLEDGE BASE"], ppt: ["PPT 编辑", "VERSIONED POWERPOINT EDITOR"], tools: ["全部工具", "TASK LIBRARY"] };
   if (!metadata[viewName]) return;
   elements.nav.forEach((button) => button.classList.toggle("active", button.dataset.view === viewName)); elements.views.forEach((view) => view.classList.toggle("active", view.id === `${viewName}-view`)); [elements.viewTitle.textContent, elements.viewEyebrow.textContent] = metadata[viewName];
-  if (viewName === "knowledge") refreshDocuments(); if (viewName === "home") renderDashboard(); if (viewName === "tools") renderTools();
+  if (viewName === "knowledge") refreshDocuments(); if (viewName === "ppt") refreshPresentations(); if (viewName === "home") renderDashboard(); if (viewName === "tools") renderTools();
   if (options.persist !== false && state.profile?.lastView !== viewName) savePreferences({ lastView: viewName }, { quiet: true }).catch(() => {});
 }
 function openSettings() { populateProfileForm(elements.settingsForm, state.profile); elements.settingsLayer.classList.remove("hidden"); }
@@ -294,6 +499,10 @@ document.querySelector("#close-command").addEventListener("click", closeCommand)
 document.querySelector("#close-context-tip").addEventListener("click", () => elements.contextTip.classList.add("hidden"));
 elements.clearActiveTool.addEventListener("click", clearActiveTool);
 elements.modelDownloadButton.addEventListener("click", startModelDownload);
+elements.modelGrid?.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-model-download]");
+  if (button && !button.disabled) startModelProfileDownload(button.dataset.modelDownload);
+});
 elements.newChat.addEventListener("click", newChat);
 elements.insightTabs.forEach((button) => button.addEventListener("click", () => switchInsight(button.dataset.insight)));
 elements.ragToggle.addEventListener("change", () => { state.ragEnabled = elements.ragToggle.checked; elements.ragLabel.textContent = state.ragEnabled ? "已启用" : "已关闭"; document.querySelector("#composer-hint").textContent = state.ragEnabled ? "本地知识库将参与回答" : "本轮不检索知识库"; savePreferences({ ragEnabled: state.ragEnabled }, { quiet: true }).catch(() => {}); renderDashboard(); });
@@ -313,11 +522,25 @@ elements.input.addEventListener("input", autoResizeComposer);
 elements.input.addEventListener("keydown", (event) => { if (event.key === "/" && !elements.input.value) { event.preventDefault(); openCommand(); } if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); elements.form.requestSubmit(); } });
 elements.stop.addEventListener("click", () => state.controller?.abort());
 elements.importButton.addEventListener("click", () => elements.documentFile.click());
+elements.pptImport.addEventListener("click", () => elements.pptFile.click());
+elements.pptSelect.addEventListener("change", () => { if (elements.pptSelect.value) loadPptPresentation(elements.pptSelect.value).catch((error) => showToast(error.message)); });
+elements.pptFile.addEventListener("change", async () => { const [file] = elements.pptFile.files; if (!file) return; elements.pptImport.disabled = true; try { const form = new FormData(); form.append("file", file, file.name); const response = await fetch(apiPath("/api/v1/presentations/import"), { method: "POST", body: form }); if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error?.message || "PPTX 导入失败"); } const payload = await response.json(); await refreshPresentations(payload.item.id); showToast("PPTX 已保存为只读原件，并建立首个版本"); } catch (error) { showToast(error.message); } finally { elements.pptImport.disabled = false; elements.pptFile.value = ""; } });
+elements.pptImageButton.addEventListener("click", () => { if (!state.ppt.current) return showToast("请先导入 PPTX"); elements.pptImageFile.click(); });
+elements.pptImageFile.addEventListener("change", async () => { const [file] = elements.pptImageFile.files; if (!file) return; try { await uploadPptAsset(file); showToast("替换图片已安全上传"); } catch (error) { showToast(error.message); } finally { elements.pptImageFile.value = ""; } });
+elements.pptGenerate.addEventListener("click", generatePptPatch);
+elements.pptConfirm.addEventListener("click", confirmPptPatch);
+elements.pptCancel.addEventListener("click", cancelPptPatch);
+elements.pptDownload.addEventListener("click", downloadCurrentPpt);
+elements.pptOpen.addEventListener("click", openCurrentPpt);
+elements.pptUndo.addEventListener("click", undoPptVersion);
+elements.pptModes.forEach((button) => button.addEventListener("click", () => setPptMode(button.dataset.pptMode)));
 elements.documentFile.addEventListener("change", async () => {
   const [file] = elements.documentFile.files; if (!file) return;
-  try { const form = new FormData(); form.append("file", file, file.name); const response = await fetch("/api/v1/documents/import", { method: "POST", body: form }); if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error?.message || "导入失败，请稍后重试"); } await Promise.all([refreshDocuments(), refreshRuntime()]); showToast(`已导入 ${file.name}，本地索引已更新`); showContextTip("imported-material", "材料已可用于对话。可以尝试“总结材料”或“提取待办”。"); } catch (error) { showToast(error.message); } finally { elements.documentFile.value = ""; }
+  try { const form = new FormData(); form.append("file", file, file.name); const response = await fetch(apiPath("/api/v1/documents/import"), { method: "POST", body: form }); if (!response.ok) { const body = await response.json().catch(() => ({})); throw new Error(body.error?.message || "导入失败，请稍后重试"); } await Promise.all([refreshDocuments(), refreshRuntime()]); showToast(`已导入 ${file.name}，本地索引已更新`); showContextTip("imported-material", "材料已可用于对话。可以尝试“总结材料”或“提取待办”。"); } catch (error) { showToast(error.message); } finally { elements.documentFile.value = ""; }
 });
 elements.settingsForm.addEventListener("submit", async (event) => { event.preventDefault(); const form = elements.settingsForm; try { await savePreferences({ displayName: form.elements.displayName.value.trim(), role: form.elements.role.value, writingTone: form.elements.writingTone.value, ragEnabled: form.elements.ragEnabled.checked }); closeSettings(); } catch (error) { showToast(error.message); } });
+elements.mobilePairForm.addEventListener("submit", (event) => event.preventDefault());
+elements.mobileServerForm.addEventListener("submit", (event) => event.preventDefault());
 elements.commandInput.addEventListener("input", () => renderCommandList(elements.commandInput.value));
 elements.commandInput.addEventListener("keydown", (event) => { if (event.key === "Escape") closeCommand(); if (event.key === "Enter") elements.commandList.querySelector("button")?.click(); });
 document.addEventListener("click", (event) => { const toolButton = event.target.closest("[data-tool]"); if (toolButton) useTool(toolButton.dataset.tool); const conversationButton = event.target.closest("[data-conversation]"); if (conversationButton) loadConversation(conversationButton.dataset.conversation); });
@@ -327,11 +550,15 @@ window.addEventListener("beforeunload", stopModelDownloadPolling);
 async function initialize() {
   try {
     setSplashStatus("正在检查本地服务");
+    registerAppShell();
+    await ensureNativeServerAddress();
+    const mobile = await refreshMobileBootstrap();
+    await ensureMobilePairing(mobile);
     // Establish the long-lived local profile cookie before concurrent API requests.
     const preferences = await request("/api/v1/preferences");
-    await Promise.all([refreshRuntime(), refreshConversations(), refreshDocuments()]);
-    applyProfile(preferences.item); renderTools(); renderDashboard(); renderWelcome(); renderContextActions(); setSplashStatus("本地工作区已准备完成"); completeSplash();
+    await Promise.all([refreshRuntime(), refreshConversations(), refreshDocuments(), refreshMobileBootstrap()]);
+    applyProfile(preferences.item); renderTools(); renderDashboard(); renderWelcome(); renderContextActions(); setSplashStatus("本地工作区已准备完成"); completeSplash(); await hideSplash();
     if (!preferences.item.onboardingComplete) openOnboarding(); else switchView(preferences.item.lastView || "home", { persist: false });
-  } catch (error) { elements.sidebarStatus.textContent = "服务连接失败"; elements.runtimeBadge.textContent = "本地服务不可用"; setSplashStatus("本地服务暂不可用"); completeSplash(); showToast(error.message); }
+  } catch (error) { elements.sidebarStatus.textContent = "服务连接失败"; elements.runtimeBadge.textContent = isNativeApp() ? "请配置后端地址" : "本地服务不可用"; setSplashStatus(isNativeApp() ? "请设置 EDGE_OFFICE_SERVER_URL" : "本地服务暂不可用"); completeSplash(); await hideSplash(); showToast(error.message); }
 }
 initialize();

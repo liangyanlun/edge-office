@@ -18,16 +18,12 @@ from .config import default_config
 from .database import Database
 from .inference import InferenceAdapter, LocalModelRegistry
 from .model_download import ModelDownloadError, ModelReleaseDownloader
+from .model_catalog import FOUR_B_MODEL_ID, build_model_catalog
+from .mobile import create_mobile_blueprint, verify_mobile_token
 from .parsers import ParseError, parse_upload
+from .ppt import PptService, create_ppt_blueprint
 from .rag import FaissRagService
-
-
-SEED_DOCUMENTS = [
-    {"id": "doc-overview", "name": "项目综述（内置）", "source": "立项申请摘要", "locator": "项目综述", "content": "本项目面向日常办公场景，研究并实现一套高效实用的轻量级智能对话系统。系统通过深度蒸馏获得轻量语言内核，再通过精准 RAG 外脑补充本地知识，适合个人电脑和离线终端。"},
-    {"id": "doc-goals", "name": "研究目标与性能指标（内置）", "source": "立项申请摘要", "locator": "研究目的", "content": "项目目标是在参数量减少 90% 以上的前提下，在办公对话任务中保持较高性能，任务完成准确率和指令遵循度损失不超过 5%。系统面向 CPU 与资源受限环境，目标首 token 响应延迟小于 500ms，整体运行内存小于 1GB。"},
-    {"id": "doc-rag", "name": "精准 RAG 机制（内置）", "source": "立项申请摘要", "locator": "研究内容 4", "content": "精准化 RAG 先从本地知识库检索候选信息，再通过引用提取模块从长文档中定位最相关的 1 到 2 个句子。它避免把整段文档直接输入小模型，从而减少上下文开销，提升回答的事实性和专业性。"},
-    {"id": "doc-roadmap", "name": "实施路线（内置）", "source": "立项申请摘要", "locator": "研究路线", "content": "实施路线分为基础构建与蒸馏实验、RAG 增强与协同设计、边缘适配与深度优化、系统集成与综合验证四个阶段。最终交付可交互应用原型、技术报告、评测结果与可复现实验材料。"},
-]
+from .schedule import ScheduleParseError, day_window
 
 
 def sse(event: str, data: dict[str, Any]) -> str:
@@ -62,10 +58,15 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
     root_dir = Path(config["ROOT_DIR"])
     app = Flask(__name__, static_folder=str(root_dir / "public"), static_url_path="")
     app.config.update(config)
+    if app.config.get("MOBILE_MODE") != "local":
+        if len(str(app.config.get("MOBILE_PAIRING_CODE", ""))) < 12 or len(str(app.config.get("MOBILE_PAIRING_SECRET", ""))) < 32:
+            raise RuntimeError("手机/LAN 模式需要至少 12 位配对码和 32 位签名密钥")
 
     database = Database(Path(app.config["DATABASE_PATH"]))
     database.initialize()
-    database.seed_documents(SEED_DOCUMENTS)
+    # Versions before 0.1.1 inserted four demo documents.  Remove only records
+    # marked builtin so a user upgrade keeps every personally imported document.
+    database.remove_builtin_documents()
     rag = FaissRagService(
         database,
         Path(app.config["INDEX_DIR"]),
@@ -105,41 +106,99 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
         on_installed=inference.refresh_model_file_state,
         can_replace=inference.can_replace_model_file,
     )
+    four_b_downloader = ModelReleaseDownloader(
+        enabled=bool(app.config["MODEL_4B_DOWNLOAD_ENABLED"]),
+        repository=str(app.config["MODEL_RELEASE_REPOSITORY"]),
+        release_tag=str(app.config["MODEL_4B_RELEASE_TAG"]),
+        models_dir=Path(str(app.config["MODELS_DIR"])),
+        model_path=Path(str(app.config["MODEL_4B_MODEL_PATH"])),
+        manifest_path=Path(str(app.config["MODEL_4B_RELEASE_MANIFEST"])),
+        checksum_path=Path(str(app.config["MODEL_4B_RELEASE_CHECKSUM"])),
+        n_ctx=int(app.config["LLAMA_N_CTX"]),
+        # A 4B model is not considered downloadable until its release manifest
+        # and acceptance gate are explicitly enabled by the maintainer.
+        release_required=True,
+        timeout_seconds=int(app.config["MODEL_DOWNLOAD_TIMEOUT_SECONDS"]),
+        max_bytes=int(app.config["MODEL_DOWNLOAD_MAX_BYTES"]),
+        can_replace=inference.can_replace_model_file,
+    )
+    model_downloaders = {"default": model_downloader, FOUR_B_MODEL_ID: four_b_downloader}
+    ppt_service = PptService(
+        database, Path(app.config["DATA_DIR"]), inference, int(app.config["MAX_UPLOAD_BYTES"]), int(app.config["MAX_PPTX_SLIDES"]),
+        allow_external_renderer=not bool(app.config["TESTING"]),
+    )
 
     def runtime_status() -> dict[str, Any]:
         return {
             "model": inference.status(),
             "modelDownload": model_downloader.status(),
+            "models": build_model_catalog(app.config, inference, model_downloaders),
             "rag": rag.status(),
             "resources": {"rssMb": process_memory_mb()},
             "documentCount": len(database.list_documents()),
+            **({"calendar": {
+                "timezone": str(app.config["SCHEDULE_TIMEZONE"]),
+                "storedEventCount": len(database.list_calendar_events()),
+                "externalConnected": False,
+                "mode": "local-sandbox",
+            }} if app.config["CALENDAR_EXPERIMENTAL_ENABLED"] else {}),
             "ingestion": {
                 "formats": ["txt", "md", "pdf", "docx", "xlsx", "csv", "pptx", "html"],
                 "ocr": {"enabled": bool(app.config["OCR_ENABLED"]), "engine": "RapidOCR + ONNX Runtime", "maxPages": int(app.config["MAX_OCR_PAGES"])},
                 "maxUploadMb": round(int(app.config["MAX_UPLOAD_BYTES"]) / 1024 / 1024),
             },
+            "ppt": ppt_service.runtime(),
         }
 
     agent = AgentOrchestrator(
         database, rag, inference, runtime_status, rag_top_k=int(app.config["RAG_TOP_K"]),
         confirmation_ttl_seconds=int(app.config["AGENT_CONFIRMATION_TTL_SECONDS"]),
         user_id=str(app.config["AGENT_LOCAL_USER_ID"]),
+        schedule_timezone=str(app.config["SCHEDULE_TIMEZONE"]),
+        calendar_enabled=bool(app.config["CALENDAR_EXPERIMENTAL_ENABLED"]),
     )
     app.extensions["database"] = database
     app.extensions["rag"] = rag
     app.extensions["agent"] = agent
     app.extensions["inference"] = inference
     app.extensions["model_downloader"] = model_downloader
+    app.extensions["model_downloaders"] = model_downloaders
     app.extensions["runtime_status"] = runtime_status
+    app.extensions["ppt"] = ppt_service
+    app.register_blueprint(create_ppt_blueprint(ppt_service))
+    app.register_blueprint(create_mobile_blueprint(runtime_status, Path(app.config["DATA_DIR"]), int(app.config["MAX_UPLOAD_BYTES"])))
 
     @app.before_request
-    def bind_local_session() -> None:
-        token = request.cookies.get("edge_office_session", "")
-        if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token):
-            token = secrets.token_urlsafe(32)
-            g.set_local_session_cookie = True
-            g.local_session_token = token
-        g.local_session_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    def bind_local_session() -> Response | None:
+        mobile_token = request.cookies.get("edge_office_mobile", "")
+        authorization = request.headers.get("Authorization", "")
+        if authorization.startswith("Bearer "):
+            mobile_token = authorization[7:].strip()
+        pairing_code = str(app.config.get("MOBILE_PAIRING_CODE", ""))
+        pairing_secret = str(app.config.get("MOBILE_PAIRING_SECRET", ""))
+        if mobile_token and pairing_code and verify_mobile_token(mobile_token, pairing_secret, pairing_code):
+            token = mobile_token
+            g.mobile_authenticated = True
+        else:
+            token = request.cookies.get("edge_office_session", "")
+            g.mobile_authenticated = False
+        remote = request.remote_addr not in {"127.0.0.1", "::1"}
+        public_mobile = request.path in {"/api/v1/health", "/api/v1/mobile/bootstrap", "/api/v1/mobile/pair"}
+        if remote and app.config.get("MOBILE_MODE") != "local" and request.path.startswith("/api/") and not public_mobile:
+            if not g.mobile_authenticated:
+                return jsonify({"error": {"code": "MOBILE_PAIRING_REQUIRED", "message": "请先配对手机"}}), 401
+            if request.method not in {"GET", "HEAD", "OPTIONS"}:
+                origin = request.headers.get("Origin", "")
+                if origin and origin != request.host_url.rstrip("/"):
+                    return jsonify({"error": {"code": "INVALID_ORIGIN", "message": "请求来源不受信任"}}), 403
+        if g.mobile_authenticated:
+            g.local_session_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        else:
+            if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token):
+                token = secrets.token_urlsafe(32)
+                g.set_local_session_cookie = True
+                g.local_session_token = token
+            g.local_session_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
         profile_token = request.cookies.get("edge_office_profile", "")
         if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", profile_token):
             profile_token = secrets.token_urlsafe(32)
@@ -167,7 +226,7 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
 
     @app.get("/api/v1/health")
     def health() -> Response:
-        return jsonify({"status": "ok", "apiVersion": "0.2", "modelStatus": inference.status()["status"], "indexStatus": "ready" if rag.status()["ready"] else "building"})
+        return jsonify({"status": "ok", "appVersion": str(app.config["APP_VERSION"]), "apiVersion": "0.2", "modelStatus": inference.status()["status"], "indexStatus": "ready" if rag.status()["ready"] else "building"})
 
     @app.get("/api/v1/runtime/status")
     def get_runtime_status() -> Response:
@@ -186,6 +245,31 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
             return jsonify({"item": model_downloader.start()}), 202
         except ModelDownloadError as exc:
             return error("MODEL_DOWNLOAD_UNAVAILABLE", str(exc), 409)
+
+    @app.get("/api/v1/models")
+    def list_models() -> Response:
+        return jsonify({"items": build_model_catalog(app.config, inference, model_downloaders)})
+
+    @app.get("/api/v1/models/<model_id>/download")
+    def model_profile_download_status(model_id: str) -> Response:
+        downloader = model_downloaders.get(model_id)
+        if downloader is None:
+            return error("MODEL_NOT_FOUND", "未找到该模型配置", 404)
+        return jsonify({"item": downloader.status(), "modelId": model_id})
+
+    @app.post("/api/v1/models/<model_id>/download")
+    def start_model_profile_download(model_id: str) -> Response:
+        payload = request.get_json(silent=True)
+        if payload not in (None, {}):
+            return error("UNTRUSTED_MODEL_DOWNLOAD_PAYLOAD", "模型下载不接受自定义链接或路径", 400)
+        downloader = model_downloaders.get(model_id)
+        if downloader is None:
+            return error("MODEL_NOT_FOUND", "未找到该模型配置", 404)
+        try:
+            return jsonify({"item": downloader.start(), "modelId": model_id}), 202
+        except ModelDownloadError as exc:
+            code = "MODEL_RELEASE_NOT_READY" if model_id == FOUR_B_MODEL_ID and not app.config["MODEL_4B_DOWNLOAD_ENABLED"] else "MODEL_DOWNLOAD_UNAVAILABLE"
+            return error(code, str(exc) if app.config["MODEL_4B_DOWNLOAD_ENABLED"] or model_id != FOUR_B_MODEL_ID else "4B 模型仍在开发和验收中，当前 Release 尚未开放下载", 409)
 
     @app.get("/api/v1/preferences")
     def get_preferences() -> Response:
@@ -207,7 +291,7 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
                 changes[database_key] = value
         if "writingTone" in payload and changes.get("writing_tone") not in {"professional", "concise", "natural"}:
             return error("INVALID_PREFERENCES", "writingTone 不在允许范围内", 400)
-        if "lastView" in payload and changes.get("last_view") not in {"home", "chat", "knowledge", "tools"}:
+        if "lastView" in payload and changes.get("last_view") not in {"home", "chat", "knowledge", "ppt", "tools"}:
             return error("INVALID_PREFERENCES", "lastView 不在允许范围内", 400)
         for api_key, database_key in {"ragEnabled": "rag_enabled", "onboardingComplete": "onboarding_complete"}.items():
             if api_key in payload:
@@ -245,17 +329,35 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
     @app.post("/api/v1/documents/import")
     def import_uploaded_document() -> Response:
         uploaded = request.files.get("file")
-        if not uploaded or not uploaded.filename:
+        payload = request.get_json(silent=True) if not uploaded else None
+        staged_name = ""
+        if uploaded and uploaded.filename:
+            staged_name = Path(uploaded.filename).name
+            data = uploaded.stream.read(int(app.config["MAX_UPLOAD_BYTES"]) + 1)
+        elif isinstance(payload, dict) and payload.get("uploadId"):
+            upload_id = str(payload.get("uploadId"))
+            if not re.fullmatch(r"[0-9a-f-]{36}", upload_id):
+                return error("UPLOAD_NOT_FOUND", "上传任务不存在", 404)
+            upload_root = Path(app.config["DATA_DIR"]) / "mobile_uploads" / upload_id
+            metadata_path = upload_root / "metadata.json"
+            if not metadata_path.is_file():
+                return error("UPLOAD_NOT_FOUND", "上传任务不存在", 404)
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            staged_name = Path(str(metadata.get("name") or "upload.bin")).name
+            staged_file = upload_root / staged_name
+            if not staged_file.is_file():
+                return error("UPLOAD_INCOMPLETE", "上传文件尚未合并", 409)
+            data = staged_file.read_bytes()
+        else:
             return error("FILE_REQUIRED", "请选择要导入的文件", 400)
-        security_level = str(request.form.get("securityLevel") or "internal")
+        security_level = str((request.form.get("securityLevel") if not payload else payload.get("securityLevel")) or "internal")
         if security_level not in {"public", "internal"}:
             return error("INVALID_SECURITY_LEVEL", "仅支持 public 或 internal 材料级别", 400)
-        data = uploaded.stream.read(int(app.config["MAX_UPLOAD_BYTES"]) + 1)
         if len(data) > int(app.config["MAX_UPLOAD_BYTES"]):
             return error("FILE_TOO_LARGE", "文件超过当前 20MB 限制", 413)
         try:
             parsed = parse_upload(
-                uploaded.filename, data, int(app.config["MAX_DOCUMENT_CHARACTERS"]),
+                staged_name, data, int(app.config["MAX_DOCUMENT_CHARACTERS"]),
                 ocr_enabled=bool(app.config["OCR_ENABLED"]), max_pdf_pages=int(app.config["MAX_PDF_PAGES"]),
                 max_ocr_pages=int(app.config["MAX_OCR_PAGES"]), max_sheets=int(app.config["MAX_XLSX_SHEETS"]),
                 max_sheet_rows=int(app.config["MAX_XLSX_ROWS_PER_SHEET"]),
@@ -264,7 +366,7 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
         except ParseError as exc:
             return error(exc.code, str(exc), 400)
         item = database.create_document(
-            Path(uploaded.filename).name, parsed.content, security_level=security_level, mime_type=parsed.mime_type,
+            staged_name, parsed.content, security_level=security_level, mime_type=parsed.mime_type,
             locator=parsed.locator, parser_name=parsed.parser_name, parser_version=parsed.parser_version,
             file_sha256=hashlib.sha256(data).hexdigest(),
             extraction_quality=parsed.extraction_quality, parser_metadata=parsed.metadata,
@@ -282,6 +384,32 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
         rag.rebuild()
         return jsonify({"ok": True})
 
+    @app.get("/api/v1/calendar/events")
+    def calendar_events() -> Response:
+        if not app.config["CALENDAR_EXPERIMENTAL_ENABLED"]:
+            return error("FEATURE_UNAVAILABLE", "日历功能未在当前版本开放", 404)
+        date_text = str(request.args.get("date") or "").strip()
+        start_at = str(request.args.get("start") or "").strip() or None
+        end_at = str(request.args.get("end") or "").strip() or None
+        if date_text:
+            try:
+                start_at, end_at = day_window(date_text, timezone=str(app.config["SCHEDULE_TIMEZONE"]))
+            except ScheduleParseError as exc:
+                return error("INVALID_CALENDAR_DATE", str(exc), 400)
+        return jsonify({"items": database.list_calendar_events(start_at=start_at, end_at=end_at), "timezone": str(app.config["SCHEDULE_TIMEZONE"])})
+
+    @app.get("/api/v1/calendar/conflicts")
+    def calendar_conflicts() -> Response:
+        if not app.config["CALENDAR_EXPERIMENTAL_ENABLED"]:
+            return error("FEATURE_UNAVAILABLE", "日历功能未在当前版本开放", 404)
+        start_at = str(request.args.get("start") or "").strip()
+        end_at = str(request.args.get("end") or "").strip()
+        if not start_at or not end_at:
+            return error("CALENDAR_WINDOW_REQUIRED", "冲突检查需要 start 和 end 参数", 400)
+        if len(start_at) > 64 or len(end_at) > 64:
+            return error("INVALID_CALENDAR_WINDOW", "时间范围格式不正确", 400)
+        return jsonify({"items": database.find_calendar_conflicts(start_at, end_at), "timezone": str(app.config["SCHEDULE_TIMEZONE"])})
+
     @app.get("/api/v1/conversations")
     def conversations() -> Response:
         return jsonify({"items": database.list_conversations()})
@@ -297,7 +425,7 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
 
     @app.get("/api/v1/agent/tools")
     def agent_tools() -> Response:
-        return jsonify({"items": agent.tools(), "policyVersion": "edge-office-agent-policy/1.0", "sandbox": True})
+        return jsonify({"items": agent.tools(calendar_enabled=agent.calendar_enabled), "policyVersion": "edge-office-agent-policy/1.0", "sandbox": True})
 
     @app.post("/api/v1/plans")
     def create_plan() -> Response:
@@ -325,7 +453,7 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
             result = agent.confirm(plan_id, session_id=g.local_session_id)
             return jsonify(result)
         except PlanValidationError as exc:
-            return error(exc.code, str(exc), 409 if exc.code.startswith("CONFIRMATION_") else 400)
+            return error(exc.code, str(exc), 409 if exc.code.startswith("CONFIRMATION_") or exc.code == "FEATURE_UNAVAILABLE" else 400)
 
     @app.post("/api/v1/plans/<plan_id>/cancel")
     def cancel_plan(plan_id: str) -> Response:

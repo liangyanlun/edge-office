@@ -152,6 +152,18 @@ class Database:
                   started_at TEXT NOT NULL,
                   completed_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS calendar_events (
+                  id TEXT PRIMARY KEY,
+                  title TEXT NOT NULL,
+                  start_at TEXT NOT NULL,
+                  end_at TEXT NOT NULL,
+                  timezone TEXT NOT NULL,
+                  participants_json TEXT NOT NULL DEFAULT '[]',
+                  source TEXT NOT NULL DEFAULT 'local',
+                  status TEXT NOT NULL DEFAULT 'draft',
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS user_preferences (
                   profile_id TEXT PRIMARY KEY,
                   display_name TEXT NOT NULL DEFAULT '',
@@ -171,6 +183,7 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_agent_plans_request_id ON agent_plans(request_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_agent_plan_events_plan_id ON agent_plan_events(plan_id, created_at);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_tool_attempts_idempotency ON agent_tool_attempts(idempotency_key);
+                CREATE INDEX IF NOT EXISTS idx_calendar_events_window ON calendar_events(start_at, end_at, status);
                 """
             )
             self._ensure_columns(connection)
@@ -211,31 +224,11 @@ class Database:
                 (content_hash, version_id, row["id"]),
             )
 
-    def seed_documents(self, documents: Iterable[dict[str, Any]]) -> bool:
+    def remove_builtin_documents(self) -> int:
+        """Remove legacy demo materials that were bundled by older application versions."""
         with self.connect() as connection:
-            existing = connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
-            if existing:
-                return False
-            created_at = now_iso()
-            for document in documents:
-                content = str(document["content"])
-                content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-                connection.execute(
-                    """INSERT INTO documents(
-                         id, name, source, locator, builtin, content, created_at, version_id, file_sha256,
-                         mime_type, security_level, parser_name, parser_version, ingestion_status
-                       ) VALUES(
-                         :id, :name, :source, :locator, :builtin, :content, :created_at, :version_id, :file_sha256,
-                         :mime_type, :security_level, :parser_name, :parser_version, :ingestion_status
-                       )""",
-                    {
-                        **document, "content": content, "builtin": 1, "created_at": created_at,
-                        "version_id": f"{document['id']}@{content_hash[:12]}", "file_sha256": content_hash,
-                        "mime_type": "text/plain", "security_level": "internal", "parser_name": "seed-text",
-                        "parser_version": "1", "ingestion_status": "ready",
-                    },
-                )
-        return True
+            result = connection.execute("DELETE FROM documents WHERE builtin = 1")
+        return max(0, int(result.rowcount))
 
     def get_preferences(self, profile_id: str) -> dict[str, Any]:
         with self.connect() as connection:
@@ -421,6 +414,90 @@ class Database:
                     status, duration_ms, now_iso(),
                 ),
             )
+
+    def create_calendar_event(
+        self,
+        *,
+        title: str,
+        start_at: str,
+        end_at: str,
+        timezone: str,
+        participants: list[str] | None = None,
+        source: str = "local",
+        status: str = "draft",
+    ) -> dict[str, Any]:
+        now = now_iso()
+        item = {
+            "id": str(uuid4()),
+            "title": str(title).strip()[:120],
+            "start_at": start_at,
+            "end_at": end_at,
+            "timezone": timezone,
+            "participants_json": json.dumps(participants or [], ensure_ascii=False),
+            "source": source,
+            "status": status,
+            "created_at": now,
+            "updated_at": now,
+        }
+        if not item["title"]:
+            raise ValueError("日程标题不能为空")
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO calendar_events(
+                   id, title, start_at, end_at, timezone, participants_json,
+                   source, status, created_at, updated_at
+                ) VALUES(:id, :title, :start_at, :end_at, :timezone, :participants_json,
+                         :source, :status, :created_at, :updated_at)""",
+                item,
+            )
+        return self._calendar_event(item)
+
+    def list_calendar_events(
+        self,
+        *,
+        start_at: str | None = None,
+        end_at: str | None = None,
+        statuses: tuple[str, ...] = ("draft", "confirmed"),
+    ) -> list[dict[str, Any]]:
+        statuses = tuple(statuses) or ("draft", "confirmed")
+        placeholders = ",".join("?" for _ in statuses)
+        clauses = [f"status IN ({placeholders})"]
+        values: list[Any] = list(statuses)
+        if start_at:
+            clauses.append("end_at > ?")
+            values.append(start_at)
+        if end_at:
+            clauses.append("start_at < ?")
+            values.append(end_at)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM calendar_events WHERE {' AND '.join(clauses)} ORDER BY start_at, end_at",
+                values,
+            ).fetchall()
+        return [self._calendar_event(row) for row in rows]
+
+    def find_calendar_conflicts(self, start_at: str, end_at: str, exclude_id: str | None = None) -> list[dict[str, Any]]:
+        clauses = ["status IN ('draft', 'confirmed')", "start_at < ?", "end_at > ?"]
+        values: list[Any] = [end_at, start_at]
+        if exclude_id:
+            clauses.append("id != ?")
+            values.append(exclude_id)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM calendar_events WHERE {' AND '.join(clauses)} ORDER BY start_at",
+                values,
+            ).fetchall()
+        return [self._calendar_event(row) for row in rows]
+
+    @staticmethod
+    def _calendar_event(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        item = dict(row)
+        item["participants"] = json.loads(item.pop("participants_json", "[]"))
+        return {
+            "id": item["id"], "title": item["title"], "startAt": item["start_at"], "endAt": item["end_at"],
+            "timezone": item["timezone"], "participants": item["participants"], "source": item["source"],
+            "status": item["status"], "createdAt": item["created_at"], "updatedAt": item["updated_at"],
+        }
 
     def create_agent_plan(
         self,

@@ -19,4 +19,9 @@ app = create_app()
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "4173"))
-    app.run(host="127.0.0.1", port=port, debug=False, threaded=True)
+    # Loopback remains the safe default. Set EDGE_OFFICE_HOST explicitly for a
+    # paired LAN/mobile session; never expose the development server publicly.
+    host = os.getenv("EDGE_OFFICE_HOST", "127.0.0.1")
+    if host not in {"127.0.0.1", "::1", "localhost"} and os.getenv("EDGE_OFFICE_MODE", "local") == "local":
+        raise RuntimeError("非本机地址必须设置 EDGE_OFFICE_MODE=lan 并配置配对码与签名密钥")
+    app.run(host=host, port=port, debug=False, threaded=True)

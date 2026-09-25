@@ -4,6 +4,7 @@ node_modules/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.tmp-*-tests-*/
 build/
 dist/
 dist-installer/
@@ -31,3 +32,27 @@ artifacts/models/*
 Thumbs.db
 .vscode/
 .idea/
+
+# Capacitor native build outputs
+android/.gradle/
+android/build/
+android/app/build/
+android/.idea/
+ios/App/Pods/
+ios/App/build/
+ios/DerivedData/
+
+# Release-ledger working files and generated previews (keep the workbook itself)
+.release-work/
+outputs/**/*.png
+outputs/**/*.inspect.ndjson
+outputs/edge-office-release-ledger/EdgeOffice-版本发布台账.xlsx
+outputs/**/~$*.xlsx
+
+# Native signing material and machine-specific configuration
+android/local.properties
+android/**/*.keystore
+android/**/*.jks
+ios/**/*.mobileprovision
+ios/**/*.p12
+*.pem

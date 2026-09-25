@@ -176,6 +176,24 @@ class InferenceAdapter:
             raise RuntimeError("llama.cpp ActionPlan 返回空内容")
         return output
 
+    def generate_constrained_text(self, system: str, user: str, max_tokens: int = 512) -> str:
+        """Generate deterministic planner text without granting it tool authority."""
+        model = self._get_model()
+        try:
+            result = model.create_chat_completion(
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                temperature=0.0,
+                top_p=1.0,
+                max_tokens=max(32, min(int(max_tokens), 1024)),
+            )
+            output = str(result["choices"][0]["message"].get("content") or "").strip()
+        except Exception as error:
+            raise RuntimeError(f"llama.cpp PPT 计划推理失败：{error}") from error
+        output = re.sub(r"<think>.*?</think>", "", output, flags=re.DOTALL).strip()
+        if not output:
+            raise RuntimeError("llama.cpp PPT 计划返回空内容")
+        return output
+
     def _get_model(self) -> Any:
         if not self.llama_cpp_enabled:
             raise RuntimeError("llama.cpp 推理已关闭")

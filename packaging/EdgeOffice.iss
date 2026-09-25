@@ -1,5 +1,5 @@
 #define MyAppName "微知 Edge Office"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.1.2"
 #define MyAppPublisher "liangyanlun"
 #define MyAppExeName "EdgeOffice.exe"
 
@@ -15,7 +15,7 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\dist-installer
-OutputBaseFilename=EdgeOffice-Setup-v0.1.0
+OutputBaseFilename=EdgeOffice-Setup-v0.1.2
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern

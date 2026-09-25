@@ -26,6 +26,8 @@ $PyInstallerArgs = @(
     "--collect-all", "onnxruntime",
     "--collect-all", "rapidocr",
     "--collect-all", "pypdfium2",
+    "--collect-all", "pptx",
+    "--collect-all", "PIL",
     "--collect-all", "llama_cpp",
     "--collect-all", "webview",
     "--collect-all", "pythonnet",
@@ -77,4 +79,4 @@ if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup 安装包构建失败。"
 }
 
-Write-Host "已生成安装包：$ProjectRoot\dist-installer\EdgeOffice-Setup-v0.1.0.exe"
+Write-Host "已生成安装包：$ProjectRoot\dist-installer\EdgeOffice-Setup-v0.1.2.exe"

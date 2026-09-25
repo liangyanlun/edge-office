@@ -1,15 +1,33 @@
 {
   "name": "edge-office-demo",
-  "version": "0.1.0",
+  "version": "0.2.0-dev.20260925",
   "private": true,
   "type": "module",
   "scripts": {
     "start": ".\\.venv\\Scripts\\python.exe run_flask.py",
     "start:node": "node server.mjs",
     "test": "node --test",
-    "test:backend": ".\\.venv\\Scripts\\python.exe -m pytest tests_py"
+    "test:backend": ".\\.venv\\Scripts\\python.exe -m pytest tests_py",
+    "mobile:init": "cap add android && cap add ios",
+    "mobile:sync": "cap sync",
+    "mobile:open:android": "cap open android",
+    "mobile:open:ios": "cap open ios"
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.5.2",
+    "@capacitor/cli": "^8.5.2",
+    "@capacitor/core": "^8.5.2",
+    "@capacitor/filesystem": "^8.1.3",
+    "@capacitor/ios": "^8.5.2",
+    "@capacitor/preferences": "^8.0.1",
+    "@capacitor/share": "^8.0.2",
+    "@capacitor/splash-screen": "^8.0.2",
+    "@capacitor/status-bar": "^8.0.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
   }
 }

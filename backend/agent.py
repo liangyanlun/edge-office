@@ -12,11 +12,14 @@ from typing import Any, Callable
 from .database import Database
 from .inference import InferenceAdapter
 from .rag import FaissRagService
+from .schedule import ScheduleParseError, day_window, parse_schedule_text
 
 
 POLICY_VERSION = "edge-office-agent-policy/1.0"
 MAX_ARGUMENT_BYTES = 8_192
 HIGH_RISK = {"email_send", "calendar_commit", "task_delete", "file_overwrite"}
+CALENDAR_TOOLS = {"calendar_find_slots", "calendar_create_draft", "calendar_commit"}
+CALENDAR_UNAVAILABLE_MESSAGE = "日历功能未在当前版本开放。你仍可让我整理会议纪要中的时间节点，但不会保存日程或发送提醒。"
 
 
 class PlanValidationError(ValueError):
@@ -38,14 +41,14 @@ class ToolDefinition:
 TOOL_REGISTRY: dict[str, ToolDefinition] = {
     "document_search": ToolDefinition("document_search", "read_only", "检索本地材料", "documents.read", "search_knowledge", {"query": (str, True), "top_k": (int, False)}),
     "document_quote": ToolDefinition("document_quote", "read_only", "定位材料原文", "documents.read", "search_knowledge", {"query": (str, True), "top_k": (int, False)}),
-    "calendar_find_slots": ToolDefinition("calendar_find_slots", "read_only", "查询日程空档（沙箱）", "calendar.read", "get_runtime_status", {"date": (str, False)}),
+    "calendar_find_slots": ToolDefinition("calendar_find_slots", "read_only", "查询日程空档（本地）", "calendar.read", "get_runtime_status", {"date": (str, False), "startAt": (str, False), "endAt": (str, False)}),
     "task_list": ToolDefinition("task_list", "read_only", "查看本地材料", "tasks.read", "list_documents", {"keyword": (str, False), "limit": (int, False)}),
     "email_create_draft": ToolDefinition("email_create_draft", "draft", "创建邮件草稿", "email.draft", "create_office_draft", {"to": (str, False), "subject": (str, False), "body": (str, True), "tone": (str, False)}),
-    "calendar_create_draft": ToolDefinition("calendar_create_draft", "draft", "创建日程草稿", "calendar.draft", "create_office_draft", {"title": (str, True), "time": (str, False), "participants": (list, False)}),
+    "calendar_create_draft": ToolDefinition("calendar_create_draft", "draft", "创建日程草稿", "calendar.draft", "create_office_draft", {"title": (str, True), "time": (str, False), "participants": (list, False), "startAt": (str, False), "endAt": (str, False), "timezone": (str, False), "durationMinutes": (int, False)}),
     "task_create_draft": ToolDefinition("task_create_draft", "draft", "创建待办草稿", "tasks.draft", "create_office_draft", {"title": (str, True), "due": (str, False)}),
     "task_update_draft": ToolDefinition("task_update_draft", "draft", "更新待办草稿", "tasks.draft", "create_office_draft", {"task_id": (str, True), "title": (str, False), "due": (str, False)}),
     "email_send": ToolDefinition("email_send", "high_risk", "发送邮件（沙箱）", "email.send", "create_office_draft", {"to": (str, True), "subject": (str, True), "body": (str, True)}),
-    "calendar_commit": ToolDefinition("calendar_commit", "high_risk", "提交日程（沙箱）", "calendar.write", "create_office_draft", {"title": (str, True), "time": (str, True), "participants": (list, False)}),
+    "calendar_commit": ToolDefinition("calendar_commit", "high_risk", "提交日程（本地沙箱）", "calendar.write", "create_office_draft", {"title": (str, True), "time": (str, False), "participants": (list, False), "startAt": (str, False), "endAt": (str, False), "timezone": (str, False), "durationMinutes": (int, False)}),
     "task_delete": ToolDefinition("task_delete", "high_risk", "删除待办（沙箱）", "tasks.delete", "create_office_draft", {"task_id": (str, True)}),
     "file_overwrite": ToolDefinition("file_overwrite", "high_risk", "覆盖文件（未开放）", "files.write", "create_office_draft", {"path": (str, True), "content": (str, True)}),
     "request_clarification": ToolDefinition("request_clarification", "control", "请求补充信息", "none", "search_knowledge", {"question": (str, True)}),
@@ -101,29 +104,51 @@ def parse_action_plan(raw: str | dict[str, Any]) -> dict[str, Any]:
 class AgentOrchestrator:
     """One-action policy Agent. Tools are allow-listed and sandbox-only."""
 
-    def __init__(self, database: Database, rag: FaissRagService, inference: InferenceAdapter, runtime_status: Callable[[], dict[str, Any]], rag_top_k: int = 2, confirmation_ttl_seconds: int = 300, user_id: str = "local-user"):
+    def __init__(self, database: Database, rag: FaissRagService, inference: InferenceAdapter, runtime_status: Callable[[], dict[str, Any]], rag_top_k: int = 2, confirmation_ttl_seconds: int = 300, user_id: str = "local-user", schedule_timezone: str = "Asia/Shanghai", calendar_enabled: bool = False):
         self.database, self.rag, self.inference, self.runtime_status = database, rag, inference, runtime_status
         self.rag_top_k = max(1, min(int(rag_top_k), 4))
         self.confirmation_ttl_seconds = max(30, min(int(confirmation_ttl_seconds), 3600))
         self.user_id = user_id
+        self.schedule_timezone = schedule_timezone or "Asia/Shanghai"
+        self.calendar_enabled = calendar_enabled
         # Confirmation capabilities never cross the browser boundary. Losing
         # this process-local state on restart invalidates pending plans safely.
         self._confirmation_lock = threading.Lock()
         self._pending_confirmations: dict[str, tuple[str, str, str]] = {}
 
     @staticmethod
-    def tools() -> list[dict[str, Any]]:
-        return [{"name": item.name, "label": item.label, "riskClass": item.risk_class, "permission": item.permission, "requiresConfirmation": item.name in HIGH_RISK, "sandbox": True, "schema": {key: {"type": typ.__name__, "required": required} for key, (typ, required) in item.fields.items()}} for item in TOOL_REGISTRY.values()]
+    def tools(calendar_enabled: bool = False) -> list[dict[str, Any]]:
+        return [{"name": item.name, "label": item.label, "riskClass": item.risk_class, "permission": item.permission, "requiresConfirmation": item.name in HIGH_RISK, "sandbox": True, "schema": {key: {"type": typ.__name__, "required": required} for key, (typ, required) in item.fields.items()}} for item in TOOL_REGISTRY.values() if calendar_enabled or item.name not in CALENDAR_TOOLS]
+
+    @staticmethod
+    def is_calendar_request(message: str) -> bool:
+        text = message.strip()
+        if "会议纪要" in text or "会议记录" in text:
+            return False
+        return any(term in text for term in ("日程", "开会", "约会", "提醒我", "安排会议", "会议安排")) or ("会议" in text and any(term in text for term in ("明天", "后天", "几点", "预约", "冲突")))
 
     def plan(self, message: str, conversation_id: str | None, rag_enabled: bool, request_id: str, session_id: str | None = None) -> dict[str, Any]:
         raw_output = ""
-        try:
-            raw_output = self.inference.create_action_plan(message, self.candidate_tools(message, rag_enabled))
-            action_plan = parse_action_plan(raw_output)
-        except (RuntimeError, PlanValidationError):
-            action_plan = self._fallback_plan(message, rag_enabled)
+        candidates = self.candidate_tools(message, rag_enabled, self.calendar_enabled)
+        if not self.calendar_enabled and self.is_calendar_request(message):
+            action_plan = {"tool": "respond_without_tool", "arguments": {"response": CALENDAR_UNAVAILABLE_MESSAGE}, "confirmed": False}
             raw_output = canonical_json(action_plan)
+        else:
+            try:
+                raw_output = self.inference.create_action_plan(message, candidates)
+                action_plan = parse_action_plan(raw_output)
+                if action_plan["tool"] not in {item["name"] for item in candidates}:
+                    raise PlanValidationError("TOOL_NOT_OFFERED", "模型选择了未提供的工具")
+            except (RuntimeError, PlanValidationError):
+                action_plan = self._fallback_plan(message, rag_enabled)
+                raw_output = canonical_json(action_plan)
         action_plan = self._bind_trusted_request_fields(action_plan, message)
+        if action_plan["tool"] in {"calendar_create_draft", "calendar_commit"} and not action_plan["arguments"].get("startAt"):
+            action_plan = {
+                "tool": "request_clarification",
+                "arguments": {"question": "请补充明确的开始时间，例如‘明天早上 8 点，时长 60 分钟’；我会先生成日程草稿，再检查冲突。"},
+                "confirmed": False,
+            }
         tool = TOOL_REGISTRY[action_plan["tool"]]
         canonical_plan = canonical_json({"tool": tool.name, "arguments": action_plan["arguments"]})
         plan_hash = hashlib.sha256((POLICY_VERSION + "\n" + canonical_plan).encode("utf-8")).hexdigest()
@@ -143,10 +168,22 @@ class AgentOrchestrator:
             plan = self.database.get_agent_plan(plan["id"]) or plan
         return plan
 
-    @staticmethod
-    def _bind_trusted_request_fields(action_plan: dict[str, Any], message: str) -> dict[str, Any]:
+    def _bind_trusted_request_fields(self, action_plan: dict[str, Any], message: str) -> dict[str, Any]:
         """Bind document retrieval to the original trusted user request."""
         if action_plan["tool"] not in {"document_search", "document_quote"}:
+            if action_plan["tool"] in {"calendar_create_draft", "calendar_commit"}:
+                try:
+                    parsed = parse_schedule_text(message, timezone=self.schedule_timezone)
+                except ScheduleParseError:
+                    return action_plan
+                arguments = {**action_plan["arguments"], **parsed}
+                return {**action_plan, "arguments": arguments, "confirmed": False}
+            if action_plan["tool"] == "calendar_find_slots":
+                try:
+                    start_at, end_at = day_window(message, timezone=self.schedule_timezone)
+                    return {**action_plan, "arguments": {**action_plan["arguments"], "startAt": start_at, "endAt": end_at}, "confirmed": False}
+                except ScheduleParseError:
+                    return action_plan
             return action_plan
         return {
             **action_plan,
@@ -155,10 +192,10 @@ class AgentOrchestrator:
         }
 
     @staticmethod
-    def candidate_tools(message: str, rag_enabled: bool = True) -> list[dict[str, Any]]:
+    def candidate_tools(message: str, rag_enabled: bool = True, calendar_enabled: bool = False) -> list[dict[str, Any]]:
         """Trusted intent gate: small models fill parameters, never broaden tool authority."""
         def select(name: str) -> list[dict[str, Any]]:
-            item = next(tool for tool in AgentOrchestrator.tools() if tool["name"] == name)
+            item = next(tool for tool in AgentOrchestrator.tools(calendar_enabled=calendar_enabled) if tool["name"] == name)
             # The intent gate narrows to one tool, but its argument contract remains
             # identical to the frozen training registry. Optional values may be
             # omitted; they must never be renamed or replaced with invented fields.
@@ -176,10 +213,17 @@ class AgentOrchestrator:
             return select("task_update_draft")
         if any(term in text for term in ("创建待办", "新增待办", "待办草稿")):
             return select("task_create_draft")
-        if any(term in text for term in ("创建日程", "日程草稿", "安排会议")):
-            return select("calendar_create_draft")
-        if "日程" in text and any(term in text for term in ("空档", "空闲", "时间")):
-            return select("calendar_find_slots")
+        check_words = ("检查", "查看", "有没有冲突", "冲突", "空档", "空闲")
+        create_words = ("创建", "安排", "开会", "会议", "约会", "提醒")
+        if AgentOrchestrator.is_calendar_request(text):
+            if not calendar_enabled:
+                return select("respond_without_tool")
+            if any(term in text for term in check_words):
+                return select("calendar_find_slots")
+            if "提交日程" in text or "提交这个日程" in text:
+                return select("calendar_commit")
+            if any(term in text for term in create_words):
+                return select("calendar_create_draft")
         if any(term in text for term in ("列出", "有哪些", "所有文档", "材料列表", "查看材料", "查看文档")):
             return select("task_list")
         if any(term in text for term in ("引用", "原文", "原句")):
@@ -208,6 +252,8 @@ class AgentOrchestrator:
         plan = self.database.get_agent_plan(plan_id)
         if not plan:
             raise PlanValidationError("PLAN_NOT_FOUND", "计划不存在")
+        if plan["tool"] in CALENDAR_TOOLS and not self.calendar_enabled:
+            raise PlanValidationError("FEATURE_UNAVAILABLE", CALENDAR_UNAVAILABLE_MESSAGE)
         with self._confirmation_lock:
             credentials = self._pending_confirmations.get(plan_id)
             if credentials is None:
@@ -239,6 +285,8 @@ class AgentOrchestrator:
         return self.database.get_agent_plan(plan_id) or {}
 
     def _execute_plan(self, plan: dict[str, Any], rag_enabled: bool, request_id: str) -> tuple[str, list[dict[str, Any]], int, dict[str, Any]]:
+        if plan["tool"] in CALENDAR_TOOLS and not self.calendar_enabled:
+            raise PlanValidationError("FEATURE_UNAVAILABLE", CALENDAR_UNAVAILABLE_MESSAGE)
         current = self.database.get_agent_plan(plan["id"])
         if not current or current["status"] not in {"VALIDATED", "CONFIRMED"}:
             raise PlanValidationError("PLAN_NOT_EXECUTABLE", "计划当前不能执行")
@@ -267,7 +315,23 @@ class AgentOrchestrator:
                 answer = self.inference.compose_answer("列出材料", docs, True, "list_documents")
                 timings.update(self.inference.last_generation_metrics())
             elif tool == "calendar_find_slots":
-                answer = "当前为本地沙箱模式，尚未连接真实日历。可先创建日程草稿，待授权接入后再查询真实空档。"
+                start_at, end_at = arguments.get("startAt"), arguments.get("endAt")
+                if not start_at or not end_at:
+                    start_at, end_at = day_window(message, timezone=self.schedule_timezone)
+                events = self.database.list_calendar_events(start_at=start_at, end_at=end_at)
+                conflicts: list[tuple[dict[str, Any], dict[str, Any]]] = []
+                for index, left in enumerate(events):
+                    for right in events[index + 1:]:
+                        if left["startAt"] < right["endAt"] and right["startAt"] < left["endAt"]:
+                            conflicts.append((left, right))
+                if not events:
+                    answer = "本地日程库中没有这一天的已保存日程，暂未发现可判断的冲突。当前仍未连接真实日历。"
+                elif conflicts:
+                    lines = [f"发现 {len(conflicts)} 组时间冲突："]
+                    lines.extend(f"- {left['title']}（{left['startAt']}–{left['endAt']}）与 {right['title']}（{right['startAt']}–{right['endAt']}）" for left, right in conflicts)
+                    answer = "\n".join(lines) + "\n\n以上仅来自本地日程库，未读取外部日历。"
+                else:
+                    answer = f"已检查本地日程库中的 {len(events)} 项安排，未发现时间重叠。当前仍未连接真实日历。"
             elif tool == "email_create_draft":
                 answer = self.inference.create_draft("邮件", arguments.get("body", ""), arguments.get("tone", "正式"))
             elif tool in {"calendar_create_draft", "task_create_draft", "task_update_draft"}:
@@ -276,6 +340,20 @@ class AgentOrchestrator:
                 answer = arguments["question"]
             elif tool == "respond_without_tool":
                 answer = arguments["response"]
+            elif tool == "calendar_commit":
+                start_at, end_at = arguments.get("startAt"), arguments.get("endAt")
+                if not start_at or not end_at:
+                    raise PlanValidationError("SCHEDULE_TIME_REQUIRED", "提交日程前必须明确开始和结束时间")
+                conflicts = self.database.find_calendar_conflicts(start_at, end_at)
+                if conflicts:
+                    answer = "检测到已有日程冲突，未提交：\n" + "\n".join(f"- {item['title']}（{item['startAt']}–{item['endAt']}）" for item in conflicts)
+                else:
+                    event = self.database.create_calendar_event(
+                        title=str(arguments.get("title") or "会议"), start_at=start_at, end_at=end_at,
+                        timezone=str(arguments.get("timezone") or self.schedule_timezone),
+                        participants=list(arguments.get("participants") or []), status="confirmed", source="local-agent",
+                    )
+                    answer = f"已在本地日程库保存：{event['title']}（{event['startAt']}–{event['endAt']}）。当前未连接外部日历。"
             elif tool in HIGH_RISK:
                 answer = f"已在本地沙箱完成“{TOOL_REGISTRY[tool].label}”演练；当前未配置真实外部连接，不会产生邮件、日历、待办或文件副作用。"
             else:
@@ -299,7 +377,7 @@ class AgentOrchestrator:
 
     def _fallback_plan(self, message: str, rag_enabled: bool) -> dict[str, Any]:
         text, lower = message.strip(), message.lower()
-        routed = self.candidate_tools(text, rag_enabled)[0]["name"]
+        routed = self.candidate_tools(text, rag_enabled, self.calendar_enabled)[0]["name"]
         if routed == "request_clarification":
             return {"tool": routed, "arguments": {"question": "请提供收件人邮箱、邮件主题和正文；我会展示准确的发送计划供你确认。"}, "confirmed": False}
         if routed == "email_send":
@@ -310,6 +388,10 @@ class AgentOrchestrator:
         if routed == "email_create_draft":
             return {"tool": "email_create_draft", "arguments": {"body": text, "tone": "正式"}, "confirmed": False}
         if routed == "calendar_create_draft":
+            return {"tool": routed, "arguments": {"title": text}, "confirmed": False}
+        if routed == "calendar_find_slots":
+            return {"tool": routed, "arguments": {"date": text}, "confirmed": False}
+        if routed == "calendar_commit":
             return {"tool": routed, "arguments": {"title": text}, "confirmed": False}
         if routed == "task_create_draft":
             return {"tool": routed, "arguments": {"title": text}, "confirmed": False}
