@@ -162,6 +162,13 @@ h2 { margin-bottom: 8px; }
 .knowledge-header h2 { margin: 4px 0 6px; font-size: 24px; }
 .knowledge-header p:not(.eyebrow) { margin: 0; color: var(--muted); font-size: 13px; }
 .knowledge-summary { display: flex; gap: 10px; flex-wrap: wrap; }
+.import-feedback { display: grid; gap: 8px; border: 1px solid #d6e3dc; border-radius: 14px; background: #f8fcfa; padding: 14px 18px; color: #355a4a; font-size: 12px; }
+.import-feedback.hidden { display: none; }
+.import-feedback ul { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.import-outcome { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; overflow-wrap: anywhere; }
+.import-outcome b { font-weight: 700; }
+.import-outcome span { color: #62736b; }
+.import-outcome.warning span, .import-outcome.error span { color: #945b2c; }
 .summary-chip { border-radius: 99px; background: var(--primary-soft); color: var(--primary); padding: 8px 12px; font-size: 12px; font-weight: 750; animation: card-enter .28s ease both; }
 .document-list { display: grid; gap: 10px; }
 .document-card { display: flex; align-items: center; justify-content: space-between; gap: 16px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); padding: 16px 18px; animation: card-enter .3s cubic-bezier(.2,.72,.2,1) both; animation-delay: calc(min(var(--item-index, 0), 8) * 35ms); transition: transform .2s ease, border-color .2s ease, box-shadow .2s ease; }
@@ -268,6 +275,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .model-download-button:disabled { color: #6f8580; border-color: #c6d8d2; background: #f5f8f7; }
 .model-download-location { overflow: hidden; color: #72817e; font-size: 10px; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; }
 .model-center-note { color: #87938f; font-size: 11px; }
+.model-center-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
+.model-center-actions .ghost-button { padding: 8px 11px; font-size: 11px; white-space: nowrap; }
 .model-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .model-card { border: 1px solid var(--line); border-radius: 12px; background: var(--surface); padding: 15px; min-width: 0; transition: transform .2s ease, border-color .2s ease, box-shadow .2s ease; }
 .model-card:hover { transform: translateY(-2px); border-color: #bfd5ce; box-shadow: 0 9px 22px rgba(28, 69, 62, .08); }
@@ -281,6 +290,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .model-card-message { min-height: 36px; margin: 12px 0 9px; color: #5d6c68; font-size: 12px; line-height: 1.55; }
 .model-card-meta { display: block; overflow: hidden; color: #8a9692; font-size: 10px; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
 .model-card-actions { display: flex; align-items: center; gap: 8px; margin-top: 13px; }
+.model-source-control { display: grid; gap: 5px; margin-top: 12px; color: #526560; font-size: 11px; }
+.model-source-control select { width: 100%; min-height: 36px; border: 1px solid #ceddd7; border-radius: 8px; padding: 7px 10px; color: #2e5147; background: #f8fbf9; }
+.model-source-control select:focus-visible { outline: 2px solid #79bba4; outline-offset: 2px; }
+.model-source-hint { color: #71847e; line-height: 1.5; }
+.document-warning { display: block; margin-top: 6px; color: #9a6027; font-size: 11px; line-height: 1.5; }
 .model-card-actions .primary-button, .model-card-actions .ghost-button { padding: 8px 10px; font-size: 11px; }
 .model-release-link { text-decoration: none; }
 .runtime-badge { border-color: #cde1d8; background: var(--mint-soft); color: #276149; padding: 8px 10px; }
@@ -453,6 +467,8 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .document-actions { align-self: stretch; justify-content: space-between; }
   .model-center-note { display: none; }
   .model-grid { grid-template-columns: 1fr; }
+  .model-center-actions { align-items: flex-end; flex-direction: column; gap: 7px; }
+  .model-center-note { text-align: right; }
 }
 
 /* Interaction clarity and desktop-window responsiveness */
@@ -596,7 +612,7 @@ button, input, textarea, select { font: inherit; }
 .ppt-preview-stage.compare { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; align-content: center; }
 .ppt-preview { width: min(100%, 980px); margin: 0; }
 .ppt-preview figcaption { margin-bottom: 6px; color: #687470; font-size: 10px; font-weight: 750; }
-.ppt-preview img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: contain; border: 1px solid #cbd3d0; background: #fff; box-shadow: 0 18px 44px rgba(31,45,41,.13); }
+.ppt-preview img { display: block; width: 100%; aspect-ratio: var(--ppt-ratio, 16 / 9); object-fit: contain; border: 1px solid #cbd3d0; background: #fff; box-shadow: 0 18px 44px rgba(31,45,41,.13); }
 .ppt-task-field { display: grid; gap: 7px; padding: 13px; color: #4f5d59; font-size: 11px; font-weight: 750; }
 .ppt-task-field textarea { resize: vertical; min-height: 104px; padding: 9px; border: 1px solid #cbd4d0; border-radius: 6px; color: var(--ink); background: #fff; line-height: 1.6; }
 .ppt-task-field textarea:focus { outline: 0; border-color: #6b9f94; box-shadow: 0 0 0 3px rgba(8,118,109,.08); }

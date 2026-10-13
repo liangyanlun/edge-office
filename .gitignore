@@ -1,13 +1,17 @@
 # Python and Node local environments
 .venv/
 node_modules/
+public/vendor/
+public/mobile-document-parser.js
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .tmp-*-tests-*/
+.tmp-ui-check/
 build/
 dist/
 dist-installer/
+dist-mobile/
 
 # Local runtime data and generated indexes
 artifacts/data/
@@ -23,6 +27,14 @@ artifacts/models/*
 *.gguf
 *.safetensors
 *.bin
+*.db
+*.sqlite
+*.sqlite3
+*.gguf.part*
+*.pt
+*.pth
+*.ckpt
+*.key
 .env
 .env.*
 !.env.example
@@ -48,6 +60,9 @@ outputs/**/*.png
 outputs/**/*.inspect.ndjson
 outputs/edge-office-release-ledger/EdgeOffice-版本发布台账.xlsx
 outputs/**/~$*.xlsx
+outputs/*
+!outputs/edge-office-release-ledger/
+public/chongqing-8d.html
 
 # Native signing material and machine-specific configuration
 android/local.properties
@@ -56,3 +71,14 @@ android/**/*.jks
 ios/**/*.mobileprovision
 ios/**/*.p12
 *.pem
+
+# Vendor only the native build inputs; never vocabulary models or upstream demos.
+android/third_party/llama.cpp/*
+!android/third_party/llama.cpp/CMakeLists.txt
+!android/third_party/llama.cpp/LICENSE
+!android/third_party/llama.cpp/AUTHORS
+!android/third_party/llama.cpp/cmake/
+!android/third_party/llama.cpp/include/
+!android/third_party/llama.cpp/src/
+!android/third_party/llama.cpp/ggml/
+!android/third_party/llama.cpp/vendor/

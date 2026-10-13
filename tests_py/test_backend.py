@@ -47,7 +47,7 @@ def test_health_and_faiss_index_are_ready(client, app, tmp_path: Path):
     response = client.get("/api/v1/health")
     assert response.status_code == 200
     assert response.get_json()["status"] == "ok"
-    assert response.get_json()["appVersion"] == "0.2.0-dev.20260925"
+    assert response.get_json()["appVersion"] == "0.2.0-dev.20261013"
     assert (tmp_path / "indexes" / "knowledge.faiss").exists()
     runtime = client.get("/api/v1/runtime/status").get_json()
     assert runtime["rag"]["chunkCount"] == 0
@@ -59,7 +59,70 @@ def test_health_and_faiss_index_are_ready(client, app, tmp_path: Path):
     models = {item["id"]: item for item in runtime["models"]}
     assert models["qwen3.5-4b-office"]["releaseTag"] == "v0.2.0-4b"
     assert models["qwen3.5-4b-office"]["downloadAvailable"] is False
-    assert models["qwen3.5-4b-office"]["status"] == "development"
+    assert models["qwen3.5-4b-office"]["status"] == "preview"
+
+
+def test_chat_scope_validates_before_creating_history(client):
+    for scope in ([], ["missing"], "all", [False]):
+        result = client.post("/api/v1/chat/stream", json={"message": "总结", "documentIds": scope})
+        assert result.status_code == 400
+    assert client.get("/api/v1/conversations").json["items"] == []
+    assert client.post("/api/v1/chat/stream", json={"message": "对比", "task": "compare"}).status_code == 400
+
+
+def test_chat_writing_never_searches_materials(app, client, monkeypatch):
+    def unexpected_search(*args, **kwargs):
+        pytest.fail("Writing tasks must not read the knowledge base")
+    monkeypatch.setattr(app.extensions["rag"], "search", unexpected_search)
+    response = client.post("/api/v1/chat/stream", json={"message": "请润色这句话：会议改到下午。", "task": "polish", "ragEnabled": True})
+    text = response.get_data(as_text=True)
+    assert "event: error" not in text
+    assert '"answerKind": "unavailable"' in text
+    assert '"ragEnabled": false' in text
+
+
+def test_selected_scope_reaches_retrieval_and_survives_history(app, client, monkeypatch):
+    db = app.extensions["database"]
+    doc = db.create_document("所选.txt", "办公室改造的项目内容。")
+    calls = []
+    def search(query, top_k, **kwargs):
+        calls.append(kwargs["document_ids"])
+        return []
+    monkeypatch.setattr(app.extensions["rag"], "search", search)
+    response = client.post("/api/v1/chat/stream", json={"message": "请总结", "task": "summary", "documentIds": [doc["id"]]})
+    assert "event: error" not in response.get_data(as_text=True)
+    assert calls == [[doc["id"]]]
+    conversation = db.get_conversation(db.list_conversations()[0]["id"])
+    assert conversation["messages"][-1]["metrics"]["documentIds"] == [doc["id"]]
+    assert conversation["messages"][-1]["metrics"]["answerKind"] == "insufficient_evidence"
+
+
+def test_compare_requires_evidence_from_both_documents(app, client, monkeypatch):
+    db = app.extensions["database"]
+    ids = [db.create_document(name, "项目说明")["id"] for name in ("甲.txt", "乙.txt")]
+    calls = []
+    def search(query, top_k, **kwargs):
+        calls.append(kwargs["document_ids"])
+        return [{"documentId": ids[0], "quote": "甲材料"}] if kwargs["document_ids"] == [ids[0]] else []
+    monkeypatch.setattr(app.extensions["rag"], "search", search)
+    response = client.post("/api/v1/chat/stream", json={"message": "对比项目说明", "task": "compare", "documentIds": ids})
+    text = response.get_data(as_text=True)
+    assert calls == [[ids[0]], [ids[1]]]
+    assert '"answerKind": "insufficient_evidence"' in text
+    assert "event: citations" not in text
+
+
+def test_text_archive_excludes_internal_configuration(app, client):
+    db = app.extensions["database"]
+    db.create_document("测试材料.txt", "可携带的提取文本")
+    conversation = db.create_conversation()
+    db.add_message(conversation["id"], "user", "测试问题")
+    response = client.get("/api/v1/workspace/export")
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.json["documents"][0]["content"] == "可携带的提取文本"
+    assert response.json["conversations"][0]["messages"][0]["content"] == "测试问题"
+    assert set(response.json["documents"][0]) == {"id", "name", "content", "created_at"}
 
 
 def test_4b_model_entry_is_visible_but_download_is_closed_until_release_ready(client):
@@ -70,6 +133,67 @@ def test_4b_model_entry_is_visible_but_download_is_closed_until_release_ready(cl
     assert client.post("/api/v1/models/qwen3.5-4b-office/download").status_code == 409
     error = client.post("/api/v1/models/qwen3.5-4b-office/download").get_json()["error"]
     assert error["code"] == "MODEL_RELEASE_NOT_READY"
+
+
+def test_verified_domestic_mirrors_are_advertised(client):
+    items = {model["id"]: model for model in client.get("/api/v1/models").get_json()["items"]}
+    repositories = {
+        "qwen3.5-0.8b-office": "liangyl233/edge_model_0.8b",
+        "qwen3.5-4b-office": "liangyl233/edge_model_4b",
+    }
+    for model_id, repository in repositories.items():
+        mirror = next(source for source in items[model_id]["sources"] if source["id"] == "modelscope")
+        assert mirror["repository"] == repository
+        assert mirror["available"] is True
+
+
+def test_domestic_mirror_can_still_be_disabled(tmp_path: Path):
+    application = create_app({
+        "ROOT_DIR": ROOT_DIR,
+        "DATA_DIR": tmp_path / "data",
+        "INDEX_DIR": tmp_path / "indexes",
+        "MODELS_DIR": tmp_path / "models",
+        "DATABASE_PATH": tmp_path / "data" / "test.db",
+        "EMBEDDING_MODEL_PATH": "",
+        "LLAMA_CPP_ENABLED": False,
+        "MODEL_MODELSCOPE_0P8_VERIFIED": False,
+        "MODEL_MODELSCOPE_4B_VERIFIED": False,
+        "TESTING": True,
+    })
+    client = application.test_client()
+    items = {model["id"]: model for model in client.get("/api/v1/models").get_json()["items"]}
+    for item in items.values():
+        mirror = next(source for source in item["sources"] if source["id"] == "modelscope")
+        assert mirror["available"] is False
+    response = client.post("/api/v1/models/qwen3.5-0.8b-office/download", json={"sourceId": "modelscope"})
+    assert response.status_code == 409
+    assert response.get_json()["error"]["code"] == "MODEL_DOWNLOAD_UNAVAILABLE"
+
+
+def test_fixed_modelscope_download_uses_its_own_repository_and_pinned_hash(tmp_path: Path):
+    models_dir = tmp_path / "models"
+    model_path = models_dir / "0p8" / "Qwen3.5-0.8B-office.Q8_0.gguf"
+    payload = b"GGUF-test-mirror"
+    repository = "liangyl233/edge_model_0.8b"
+    expected_url = f"https://modelscope.cn/models/{repository}/resolve/master/{model_path.name}"
+
+    def opener(request, timeout):
+        assert request.full_url == expected_url
+        return _DownloadResponse(payload)
+
+    downloader = ModelReleaseDownloader(
+        enabled=True, repository="liangyanlun/edge-office", release_tag="v0.1.0",
+        models_dir=models_dir, model_path=model_path,
+        manifest_path=model_path.with_name("release.manifest.json"),
+        checksum_path=model_path.with_suffix(".SHA256SUMS.txt"),
+        n_ctx=2048, release_required=True, opener=opener,
+        pinned_sha256=hashlib.sha256(payload).hexdigest(),
+        mirror_repository=repository, mirror_verified=True,
+    )
+    result = downloader.install_sync("modelscope")
+    assert result["verification"] == "pinned-sha256"
+    assert result["sourceId"] == "modelscope"
+    assert model_path.read_bytes() == payload
 
 
 class _DownloadResponse:
@@ -207,10 +331,91 @@ def test_pinned_release_download_does_not_call_the_rate_limited_github_api(tmp_p
     assert downloader.install_sync()["verification"] == "sha256sums"
 
 
+def test_pinned_split_release_joins_only_verified_parts(tmp_path: Path):
+    models_dir = tmp_path / "models"
+    model_path = models_dir / "4b" / "Qwen3.5-4B-PPT.Q4_K_M.gguf"
+    pieces = (b"GGUF-first-part", b"-second-part")
+    combined = b"".join(pieces)
+    parts = tuple((f"{model_path.name}.part-{i:02d}", len(piece), hashlib.sha256(piece).hexdigest()) for i, piece in enumerate(pieces))
+    base = "https://github.com/liangyanlun/edge-office/releases/download/v0.2.0-4b"
+    payloads = {f"{base}/{name}": piece for (name, _, _), piece in zip(parts, pieces)}
+
+    def opener(request, timeout):
+        assert "api.github.com" not in request.full_url
+        return _DownloadResponse(payloads[request.full_url])
+
+    downloader = ModelReleaseDownloader(
+        enabled=True, repository="liangyanlun/edge-office", release_tag="v0.2.0-4b",
+        models_dir=models_dir, model_path=model_path, manifest_path=model_path.with_name("release.manifest.json"),
+        checksum_path=model_path.with_suffix(".SHA256SUMS.txt"), n_ctx=2048, release_required=True,
+        max_bytes=1024 * 1024, opener=opener, pinned_parts=parts,
+        pinned_sha256=hashlib.sha256(combined).hexdigest(),
+    )
+    result = downloader.install_sync()
+    assert result["verification"] == "pinned-part-and-merged-sha256"
+    assert model_path.read_bytes() == combined
+    assert hashlib.sha256(model_path.read_bytes()).hexdigest() in downloader.checksum_path.read_text(encoding="utf-8")
+
+    model_path.unlink()
+    payloads[f"{base}/{parts[1][0]}"] = b"tampered"
+    with pytest.raises(ModelDownloadError, match="第 2 片"):
+        downloader.install_sync()
+    assert not model_path.exists()
+
+
+def test_pinned_split_modelscope_uses_4b_repository(tmp_path: Path):
+    models_dir = tmp_path / "models"
+    model_path = models_dir / "4b" / "Qwen3.5-4B-PPT.Q4_K_M.gguf"
+    pieces = (b"GGUF-part-zero", b"-part-one")
+    combined = b"".join(pieces)
+    parts = tuple((f"{model_path.name}.part-{i:02d}", len(piece), hashlib.sha256(piece).hexdigest()) for i, piece in enumerate(pieces))
+    repository = "liangyl233/edge_model_4b"
+    base = f"https://modelscope.cn/models/{repository}/resolve/master"
+    payloads = {f"{base}/{name}": piece for (name, _, _), piece in zip(parts, pieces)}
+
+    def opener(request, timeout):
+        assert request.full_url in payloads
+        return _DownloadResponse(payloads[request.full_url])
+
+    downloader = ModelReleaseDownloader(
+        enabled=True, repository="liangyanlun/edge-office", release_tag="v0.2.0-4b",
+        models_dir=models_dir, model_path=model_path,
+        manifest_path=model_path.with_name("release.manifest.json"),
+        checksum_path=model_path.with_suffix(".SHA256SUMS.txt"),
+        n_ctx=2048, release_required=True, max_bytes=1024 * 1024, opener=opener,
+        pinned_parts=parts, pinned_sha256=hashlib.sha256(combined).hexdigest(),
+        mirror_repository=repository, mirror_verified=True,
+    )
+    result = downloader.install_sync("modelscope")
+    assert result["verification"] == "pinned-part-and-merged-sha256"
+    assert result["sourceId"] == "modelscope"
+    assert model_path.read_bytes() == combined
+
+
 def test_model_download_endpoint_rejects_client_supplied_urls(client):
     response = client.post("/api/v1/model/download", json={"url": "https://example.invalid/model.gguf"})
     assert response.status_code == 400
     assert response.get_json()["error"]["code"] == "UNTRUSTED_MODEL_DOWNLOAD_PAYLOAD"
+
+
+def test_model_activation_requires_verified_file_and_persists_choice(client, app):
+    model_id = "qwen3.5-0.8b-office"
+    endpoint = f"/api/v1/models/{model_id}/activate"
+    assert client.post(endpoint, json={"path": "C:\\other.gguf"}).status_code == 400
+    assert client.post(endpoint).get_json()["error"]["code"] == "MODEL_NOT_VERIFIED"
+    downloader = app.extensions["model_downloaders"]["default"]
+    downloader.model_path.parent.mkdir(parents=True, exist_ok=True)
+    downloader.model_path.write_bytes(b"verified")
+    downloader.checksum_path.write_text(
+        hashlib.sha256(b"verified").hexdigest() + "  " + downloader.model_path.name + "\n", encoding="utf-8"
+    )
+    result = client.post(endpoint)
+    assert result.status_code == 200
+    assert result.get_json()["item"]["restartRequired"] is True
+    choice = downloader.models_dir / "active_model.json"
+    assert json.loads(choice.read_text(encoding="utf-8"))["modelId"] == model_id
+    downloader.model_path.write_bytes(b"changed")
+    assert client.post(endpoint).get_json()["error"]["code"] == "MODEL_HASH_MISMATCH"
 
 
 def test_faiss_index_can_be_written_under_a_chinese_path(tmp_path: Path):
@@ -409,6 +614,25 @@ def test_model_citation_validation_normalizes_square_brackets():
     assert "【1】" in answer
     assert "[1]" not in answer
     assert "[9]" not in answer
+
+
+def test_model_citation_validation_removes_internal_evidence_scaffolding():
+    evidence = [
+        {"chunkId": "doc@v#chunk-1", "quote": "原语和模板已经完成验证。"},
+        {"chunkId": "doc@v#chunk-2", "quote": "论文结论不能替代本地实验。"},
+    ]
+    answer = InferenceAdapter._ensure_citations(
+        "用户要求总结关于动作原语的部分，我需要从提供的证据中找到相关内容。\n\n从【证据 1】中可以看到相关信息。",
+        evidence,
+    )
+    assert answer == ""
+
+
+def test_model_citation_validation_does_not_append_unbounded_evidence_list():
+    evidence = [{"chunkId": "doc@v#chunk-1", "quote": "可核对原文。"}]
+    answer = InferenceAdapter._ensure_citations("结论是可核对的。", evidence)
+    assert answer.endswith("【1】")
+    assert "本轮检索证据" not in answer
 
 
 def test_llama_metrics_use_reported_completion_tokens_and_real_inference_time(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

@@ -109,10 +109,11 @@ function splitSentences(content) {
     .filter(Boolean);
 }
 
-function retrieve(query) {
+function retrieve(query, allowedIds = null) {
   const queryTokens = tokens(query);
   const candidates = [];
   for (const document of state.documents) {
+    if (Array.isArray(allowedIds) && !allowedIds.includes(document.id)) continue;
     for (const sentence of splitSentences(document.content)) {
       const sentenceTokens = tokens(sentence);
       let score = 0;
@@ -205,8 +206,11 @@ async function streamChat(req, res) {
   await new Promise((resolve) => setTimeout(resolve, 60));
 
   const retrievalStarted = performance.now();
-  const ragEnabled = payload.ragEnabled !== false;
-  const evidence = ragEnabled ? retrieve(question) : [];
+  const ragEnabled = payload.task && ["email", "polish", "minutes", "rewrite"].includes(payload.task) ? false : payload.ragEnabled !== false;
+  const allowedIds = payload.documentIds == null ? null : Array.isArray(payload.documentIds) ? [...new Set(payload.documentIds)] : [];
+  if (payload.task === "compare" && (!allowedIds || allowedIds.length !== 2)) return json(res, 400, { error: { code: "COMPARE_SCOPE_REQUIRED", message: "请明确选择要对比的两份材料" } });
+  if (allowedIds && allowedIds.some(id => !state.documents.some(document => document.id === id))) return json(res, 400, { error: { code: "DOCUMENT_SCOPE_EXPIRED", message: "所选材料已不存在，请重新选择" } });
+  const evidence = ragEnabled ? retrieve(question, allowedIds) : [];
   const retrievalMs = Math.round(performance.now() - retrievalStarted);
   if (evidence.length) sendEvent(res, "citations", { items: evidence });
   sendEvent(res, "stage", { name: "generation", label: "正在生成可追溯回答" });
@@ -229,7 +233,9 @@ async function streamChat(req, res) {
     retrievalMs,
     generationMs,
     tokensPerSecond: Math.round((Math.max(1, emitted.length / 1.8) / generationMs) * 1000 * 10) / 10,
-    peakRssMb: memoryMb()
+    peakRssMb: memoryMb(),
+    answerKind: ragEnabled ? (evidence.length ? "extractive" : "insufficient_evidence") : "generated",
+    documentIds: allowedIds
   };
   conversation.messages.push({
     id: randomUUID(),
@@ -262,6 +268,9 @@ export function createAppServer() {
       if (req.method === "GET" && path === "/") return staticFile(res, "index.html", "text/html; charset=utf-8");
       if (req.method === "GET" && path === "/app.js") return staticFile(res, "app.js", "text/javascript; charset=utf-8");
       if (req.method === "GET" && path === "/styles.css") return staticFile(res, "styles.css", "text/css; charset=utf-8");
+      if (req.method === "GET" && path === "/experience.css") return staticFile(res, "experience.css", "text/css; charset=utf-8");
+      if (req.method === "GET" && path === "/experience.js") return staticFile(res, "experience.js", "text/javascript; charset=utf-8");
+      if (req.method === "GET" && path === "/native-bridge.js") return staticFile(res, "native-bridge.js", "text/javascript; charset=utf-8");
 
       if (req.method === "GET" && path === "/api/v1/health") {
         return json(res, 200, { status: "ok", apiVersion: "0.1", modelStatus: "demo-ready", indexStatus: "ready" });
@@ -301,6 +310,9 @@ export function createAppServer() {
       if (req.method === "GET" && path.startsWith("/api/v1/conversations/")) {
         const conversation = findConversation(decodeURIComponent(path.split("/").at(-1)));
         return conversation ? json(res, 200, { item: conversation }) : notFound(res);
+      }
+      if (req.method === "GET" && path === "/api/v1/workspace/export") {
+        return json(res, 200, { format: "edge-office-text-archive/1", includes: ["conversation_text", "extracted_document_text"], excludes: ["models", "original_files", "settings", "credentials"], documents: state.documents.map(({id,name,content,createdAt}) => ({id,name,content,createdAt})), conversations: state.conversations });
       }
       if (req.method === "POST" && path === "/api/v1/chat/stream") return streamChat(req, res);
 

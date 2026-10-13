@@ -42,7 +42,7 @@ def create_mobile_blueprint(runtime_status: Callable[[], dict[str, Any]], data_d
     @blueprint.get("/api/v1/mobile/bootstrap")
     def bootstrap() -> Response:
         runtime = runtime_status()
-        model = runtime.get("model", {})
+        model = runtime.get("chatModel") or runtime.get("model", {})
         ppt_capability = runtime.get("ppt", {}).get("capability", {})
         pairing_required = bool(current_app.config.get("MOBILE_PAIRING_CODE"))
         return jsonify({
@@ -56,11 +56,11 @@ def create_mobile_blueprint(runtime_status: Callable[[], dict[str, Any]], data_d
                 "agent": True,
                 "ppt": True,
                 "streaming": True,
-                "localInference": model.get("status") == "ready",
+                "localInference": model.get("status") in {"llama-cpp-ready", "llama-cpp-available"},
                 "resumableUpload": True,
             },
             "model": {
-                "name": model.get("modelName") or model.get("modelPath"),
+                "name": model.get("name") or model.get("modelName"),
                 "status": model.get("status"),
                 "pptRecommended": bool(ppt_capability.get("recommended", False)),
                 "pptWarning": ppt_capability.get("warning"),

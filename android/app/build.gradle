@@ -3,12 +3,34 @@ apply plugin: 'com.android.application'
 android {
     namespace = "com.edgeoffice.app"
     compileSdk = rootProject.ext.compileSdkVersion
+    ndkVersion "28.0.13004108"
+    buildFeatures {
+        buildConfig true
+    }
     defaultConfig {
         applicationId "com.edgeoffice.app"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        ndk {
+            // 4B GGUF inference needs a 64-bit address space; excluding
+            // armeabi-v7a also avoids unsupported half-precision kernels.
+            abiFilters "arm64-v8a"
+        }
+        versionCode 11
+        versionName "0.2.0-dev.20261013"
+        // Public ModelScope files were checked against pinned size/SHA-256
+        // metadata and byte-range downloads on 2026-09-30. The app rehashes
+        // every complete download before installation.
+        def mirrorRepo0p8 = (project.findProperty('edgeOfficeModelScope0p8Repo') ?: 'liangyl233/edge_model_0.8b').toString()
+        def mirrorRepo4b = (project.findProperty('edgeOfficeModelScope4bRepo') ?: 'liangyl233/edge_model_4b').toString()
+        if (!(mirrorRepo0p8 ==~ /[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/) ||
+            !(mirrorRepo4b ==~ /[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/)) {
+            throw new GradleException('ModelScope repositories must be owner/repository')
+        }
+        buildConfigField "String", "MODELSCOPE_0P8_REPOSITORY", "\"${mirrorRepo0p8}\""
+        buildConfigField "String", "MODELSCOPE_4B_REPOSITORY", "\"${mirrorRepo4b}\""
+        buildConfigField "boolean", "MODELSCOPE_0P8_VERIFIED", "${(project.findProperty('edgeOfficeModelScope0p8Verified') ?: 'true').toString().toBoolean()}"
+        buildConfigField "boolean", "MODELSCOPE_4B_VERIFIED", "${(project.findProperty('edgeOfficeModelScope4bVerified') ?: 'true').toString().toBoolean()}"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -20,6 +42,12 @@ android {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path file('src/main/cpp/CMakeLists.txt')
+            version '3.31.1'
         }
     }
 }

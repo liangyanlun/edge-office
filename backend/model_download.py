@@ -41,6 +41,10 @@ class ModelReleaseDownloader:
         on_installed: Callable[[], None] | None = None,
         can_replace: Callable[[], bool] | None = None,
         opener: Callable[..., Any] = urlopen,
+        pinned_parts: tuple[tuple[str, int, str], ...] = (),
+        pinned_sha256: str = "",
+        mirror_repository: str = "",
+        mirror_verified: bool = False,
     ):
         self.enabled = enabled
         self.repository = repository.strip()
@@ -56,6 +60,11 @@ class ModelReleaseDownloader:
         self.on_installed = on_installed
         self.can_replace = can_replace or (lambda: True)
         self.opener = opener
+        self.pinned_parts = pinned_parts
+        self.pinned_sha256 = pinned_sha256.lower()
+        self.mirror_repository = mirror_repository.strip()
+        self.mirror_verified = mirror_verified
+        self._source_id = "modelscope" if self.mirror_verified and self.mirror_repository else "github"
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._state: dict[str, Any] = {
@@ -65,6 +74,7 @@ class ModelReleaseDownloader:
             "totalBytes": None,
             "releaseTag": None,
             "verification": None,
+            "sourceId": self._source_id,
             "error": None,
             "updatedAt": None,
         }
@@ -79,6 +89,7 @@ class ModelReleaseDownloader:
         return {
             "enabled": self.enabled,
             "repository": self.repository,
+            "mirrorRepository": self.mirror_repository or None,
             "configuredTag": self.release_tag or "latest",
             "modelDirectory": str(self.model_path.parent),
             "modelPath": str(self.model_path),
@@ -89,6 +100,7 @@ class ModelReleaseDownloader:
             "totalBytes": total,
             "progressPercent": round(downloaded * 100 / total, 1) if isinstance(total, int) and total > 0 else None,
             "releaseTag": state["releaseTag"],
+            "sourceId": state.get("sourceId", "github"),
             "verification": state["verification"],
             "error": state["error"],
             "modelInstalled": self.model_path.is_file(),
@@ -98,9 +110,11 @@ class ModelReleaseDownloader:
             "updatedAt": state["updatedAt"],
         }
 
-    def start(self) -> dict[str, Any]:
+    def start(self, source_id: str | None = None) -> dict[str, Any]:
         if not self.enabled:
             raise ModelDownloadError("当前版本未启用模型下载")
+        source_id = source_id or ("modelscope" if self.mirror_verified and self.mirror_repository else "github")
+        self._validate_source(source_id)
         if not self.can_replace():
             raise ModelDownloadError("模型正在被本地推理占用。请重启应用后再下载或更新模型")
         with self._lock:
@@ -109,21 +123,25 @@ class ModelReleaseDownloader:
             else:
                 already_running = False
                 self._state.update({
-                    "state": "downloading", "phase": "正在连接 GitHub Release", "downloadedBytes": 0,
+                    "state": "downloading", "phase": "正在连接国内镜像" if source_id == "modelscope" else "正在连接 GitHub Release", "downloadedBytes": 0,
                     "totalBytes": None, "releaseTag": None, "verification": None, "error": None,
+                    "sourceId": source_id,
                     "updatedAt": int(time.time()),
                 })
+                self._source_id = source_id
                 self._thread = threading.Thread(target=self._run, name="edge-office-model-download", daemon=True)
                 self._thread.start()
         if already_running:
             return self.status()
         return self.status()
 
-    def install_sync(self) -> dict[str, Any]:
+    def install_sync(self, source_id: str = "github") -> dict[str, Any]:
         """Synchronous install entrypoint used only by isolated unit tests."""
+        self._validate_source(source_id)
         if not self.can_replace():
             raise ModelDownloadError("模型正在被本地推理占用。请重启应用后再下载或更新模型")
-        self._set_state(state="downloading", phase="正在连接 GitHub Release", error=None, downloadedBytes=0, totalBytes=None)
+        self._source_id = source_id
+        self._set_state(state="downloading", phase="正在连接国内镜像" if source_id == "modelscope" else "正在连接 GitHub Release", error=None, downloadedBytes=0, totalBytes=None, sourceId=source_id)
         self._install()
         return self.status()
 
@@ -136,6 +154,9 @@ class ModelReleaseDownloader:
             self._set_state(state="failed", phase="下载失败", error="模型下载失败，请检查网络后重试")
 
     def _install(self) -> None:
+        if self._source_id == "modelscope" and not self.pinned_parts:
+            self._install_mirror_single()
+            return
         if self.release_tag:
             self._install_pinned_release()
             return
@@ -200,7 +221,15 @@ class ModelReleaseDownloader:
         verification boundary.
         """
         release_tag = self.release_tag
-        base = f"https://github.com/{self.repository}/releases/download/{quote(release_tag, safe='')}"
+        if self.pinned_parts:
+            self._install_pinned_parts(release_tag)
+            return
+        if self.pinned_sha256:
+            self._install_fixed_single(
+                f"https://github.com/{self.repository}/releases/download/{quote(release_tag, safe='')}"
+            )
+            return
+        base = self._asset_base(release_tag)
         model_asset = {"name": self.model_path.name, "browser_download_url": f"{base}/{quote(self.model_path.name)}"}
         checksum_asset = {"name": self.checksum_path.name, "browser_download_url": f"{base}/{quote(self.checksum_path.name)}"}
         self._set_state(releaseTag=release_tag, phase="正在读取固定 Release")
@@ -227,6 +256,129 @@ class ModelReleaseDownloader:
             self._set_state(state="completed", phase="模型已安装", verification="sha256sums", error=None)
         finally:
             shutil.rmtree(staging_root, ignore_errors=True)
+
+    def _install_pinned_parts(self, release_tag: str) -> None:
+        """Join an allowlisted split Release without trusting release-body text at runtime."""
+        if not self._SHA256_PATTERN.fullmatch(self.pinned_sha256):
+            raise ModelDownloadError("分片模型缺少内置的完整文件 SHA-256")
+        total = sum(size for _, size, _ in self.pinned_parts)
+        if total > self.max_bytes:
+            raise ModelDownloadError("分片模型超过下载上限")
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+        if shutil.disk_usage(self.models_dir).free < total + 160 * 1024 * 1024:
+            raise ModelDownloadError("磁盘可用空间不足，请至少留出模型大小及额外 160 MB")
+        base = self._asset_base(release_tag)
+        staging_root = self.models_dir / ".downloads" / str(uuid4())
+        staging_root.mkdir(parents=True, exist_ok=False)
+        staged_model = staging_root / self.model_path.name
+        staged_checksum = staging_root / self.checksum_path.name
+        self._set_state(releaseTag=release_tag, totalBytes=total)
+        whole = hashlib.sha256()
+        completed = 0
+        try:
+            with staged_model.open("wb") as output:
+                for number, (name, expected_size, expected_digest) in enumerate(self.pinned_parts, 1):
+                    if name != f"{self.model_path.name}.part-{number - 1:02d}" or expected_size <= 0 or not self._SHA256_PATTERN.fullmatch(expected_digest):
+                        raise ModelDownloadError("分片模型的内置配置无效")
+                    self._set_state(phase=f"正在下载第 {number}/{len(self.pinned_parts)} 片")
+                    url = f"{base}/{quote(name, safe='')}"
+                    request = Request(url, headers={"Accept": "application/octet-stream", "User-Agent": "EdgeOffice-ModelDownloader/1.0"})
+                    part = hashlib.sha256()
+                    received = 0
+                    try:
+                        with self.opener(request, timeout=self.timeout_seconds) as response:
+                            self._validate_response_host(response)
+                            while True:
+                                block = response.read(1024 * 1024)
+                                if not block:
+                                    break
+                                received += len(block)
+                                if received > expected_size:
+                                    raise ModelDownloadError("模型分片大小超出固定清单")
+                                part.update(block)
+                                whole.update(block)
+                                output.write(block)
+                                self._set_state(downloadedBytes=completed + received)
+                    except ModelDownloadError:
+                        raise
+                    except Exception as error:
+                        raise ModelDownloadError("模型分片下载中断，请检查网络后重试") from error
+                    if received != expected_size or part.hexdigest() != expected_digest:
+                        raise ModelDownloadError(f"第 {number} 片大小或 SHA-256 校验失败，已取消安装")
+                    completed += received
+                output.flush()
+                os.fsync(output.fileno())
+            self._set_state(phase="正在校验合并后的 GGUF")
+            if completed != total or whole.hexdigest() != self.pinned_sha256:
+                raise ModelDownloadError("合并后的 GGUF SHA-256 校验失败，已取消安装")
+            if not self.can_replace():
+                raise ModelDownloadError("模型正在被本地推理占用。请重启应用后再下载或更新模型")
+            staged_checksum.write_text(f"{self.pinned_sha256}  {self.model_path.name}\n", encoding="utf-8")
+            self._set_state(phase="正在安装到本机")
+            self._install_files(staged_model, None, staged_checksum)
+            if self.on_installed:
+                self.on_installed()
+            self._set_state(state="completed", phase="分片校验完成 · 预发布试用模型", verification="pinned-part-and-merged-sha256", error=None)
+        finally:
+            shutil.rmtree(staging_root, ignore_errors=True)
+
+    def _install_mirror_single(self) -> None:
+        self._install_fixed_single(self._asset_base(self.release_tag), phase="正在下载国内镜像模型", done_phase="国内镜像模型已校验安装")
+
+    def _install_fixed_single(self, base: str, *, phase: str = "正在下载固定 Release 模型", done_phase: str = "模型已校验安装") -> None:
+        if not self._SHA256_PATTERN.fullmatch(self.pinned_sha256):
+            raise ModelDownloadError("固定模型缺少内置的模型 SHA-256")
+        staging_root = self.models_dir / ".downloads" / str(uuid4())
+        staging_root.mkdir(parents=True, exist_ok=False)
+        staged_model = staging_root / self.model_path.name
+        staged_checksum = staging_root / self.checksum_path.name
+        try:
+            self._set_state(releaseTag=self.release_tag, phase=phase)
+            actual_sha = self._download_asset(
+                {"browser_download_url": f"{base}/{quote(self.model_path.name)}"},
+                staged_model, track_progress=True,
+            )
+            self._set_state(phase="正在校验模型")
+            if actual_sha != self.pinned_sha256:
+                raise ModelDownloadError("固定模型 SHA-256 与应用内固定值不一致，已取消安装")
+            if not self.can_replace():
+                raise ModelDownloadError("模型正在被本地推理占用。请重启应用后再下载或更新模型")
+            staged_checksum.write_text(f"{self.pinned_sha256}  {self.model_path.name}\n", encoding="utf-8")
+            self._set_state(phase="正在安装到本机")
+            self._install_files(staged_model, None, staged_checksum)
+            if self.on_installed:
+                self.on_installed()
+            self._set_state(state="completed", phase=done_phase, verification="pinned-sha256", error=None)
+        finally:
+            shutil.rmtree(staging_root, ignore_errors=True)
+
+    def _asset_base(self, release_tag: str) -> str:
+        if self._source_id == "modelscope":
+            return f"https://modelscope.cn/models/{self.mirror_repository}/resolve/master"
+        return f"https://github.com/{self.repository}/releases/download/{quote(release_tag, safe='')}"
+
+    def _validate_response_host(self, response: Any) -> None:
+        geturl = getattr(response, "geturl", None)
+        if not callable(geturl):  # Synthetic test stream, not a network response.
+            return
+        parsed = urlparse(str(geturl()))
+        host = (parsed.hostname or "").lower()
+        if self._source_id == "modelscope":
+            allowed = host == "modelscope.cn" or host.endswith(".modelscope.cn") or host.endswith(".aliyuncs.com")
+        else:
+            allowed = host in {"github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"}
+        if parsed.scheme != "https" or not allowed:
+            raise ModelDownloadError("模型下载跳转到了不受信任的站点，已阻止")
+
+    def _validate_source(self, source_id: str) -> None:
+        if source_id == "github":
+            return
+        if source_id != "modelscope":
+            raise ModelDownloadError("不支持的模型下载源")
+        if not self.mirror_verified or not self.mirror_repository:
+            raise ModelDownloadError("国内镜像尚未完成上传和哈希核验")
+        if not self._REPOSITORY_PATTERN.fullmatch(self.mirror_repository):
+            raise ModelDownloadError("国内镜像仓库配置无效")
 
     def _fetch_release(self) -> dict[str, Any]:
         endpoint = "latest" if not self.release_tag else f"tags/{quote(self.release_tag, safe='')}"
@@ -281,6 +433,7 @@ class ModelReleaseDownloader:
         downloaded = 0
         try:
             with self.opener(request, timeout=self.timeout_seconds) as response, destination.open("wb") as handle:
+                self._validate_response_host(response)
                 content_length = response.headers.get("Content-Length")
                 remote_size = int(content_length) if content_length and content_length.isdigit() else None
                 if remote_size and remote_size > self.max_bytes:
@@ -381,6 +534,8 @@ class ModelReleaseDownloader:
     def _validate_configuration(self) -> None:
         if not self._REPOSITORY_PATTERN.fullmatch(self.repository):
             raise ValueError("MODEL_RELEASE_REPOSITORY 格式不正确")
+        if self.mirror_repository and not self._REPOSITORY_PATTERN.fullmatch(self.mirror_repository):
+            raise ValueError("ModelScope 仓库 ID 格式不正确")
         if self.max_bytes < 1024 * 1024:
             raise ValueError("MODEL_DOWNLOAD_MAX_BYTES 过小")
 

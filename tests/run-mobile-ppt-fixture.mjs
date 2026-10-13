@@ -1,0 +1,10 @@
+import {readFile,writeFile} from 'node:fs/promises';
+import {DOMParser} from 'linkedom';
+import {replayPpt,parsePptCalls} from '../public/mobile-ppt.js';
+globalThis.DOMParser=DOMParser;
+globalThis.XMLSerializer=class {serializeToString(node){return node.toString();}};
+const [input,output,asset]=process.argv.slice(2);
+const uri='asset://upload/12345678-abcd';
+const source=`replace_paragraph(2,0,'手机新标题')\nclone_paragraph(2,0)\ndel_paragraph(2,1)\nreplace_image(3,'${uri}')\ndel_image(4)`;
+const result=replayPpt(new Uint8Array(await readFile(input)),'slide-1',parsePptCalls(source),[{id:'12345678-abcd',uri,bytes:new Uint8Array(await readFile(asset))}]);
+await writeFile(output,result.bytes);

@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import time
+import threading
 from pathlib import Path
 from typing import Any, Generator
 from uuid import uuid4
@@ -18,7 +19,7 @@ from .config import default_config
 from .database import Database
 from .inference import InferenceAdapter, LocalModelRegistry
 from .model_download import ModelDownloadError, ModelReleaseDownloader
-from .model_catalog import FOUR_B_MODEL_ID, build_model_catalog
+from .model_catalog import FOUR_B_MODEL_ID, FOUR_B_PARTS, FOUR_B_SHA256, ZERO_EIGHT_B_SHA256, build_model_catalog
 from .mobile import create_mobile_blueprint, verify_mobile_token
 from .parsers import ParseError, parse_upload
 from .ppt import PptService, create_ppt_blueprint
@@ -55,9 +56,42 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
     config = default_config()
     if overrides:
         config.update(overrides)
+        if "DATA_DIR" in overrides and "MODEL_STORAGE_SETTINGS" not in overrides:
+            config["MODEL_STORAGE_SETTINGS"] = Path(str(config["DATA_DIR"])) / "desktop_storage.json"
+        if "MODELS_DIR" in overrides:
+            models_root = Path(str(config["MODELS_DIR"]))
+            default_file = models_root / "qwen3_5_0p8_office_q8_0" / "Qwen3.5-0.8B-office.Q8_0.gguf"
+            four_b_file = models_root / "qwen3_5_4b_office_q4_k_m" / "Qwen3.5-4B-PPT.Q4_K_M.gguf"
+            for key, value in {
+                "MODEL_0P8_MODEL_PATH": default_file,
+                "MODEL_0P8_RELEASE_MANIFEST": default_file.with_name("release.manifest.json"),
+                "MODEL_0P8_RELEASE_CHECKSUM": default_file.with_name(f"{default_file.stem}.SHA256SUMS.txt"),
+                "MODEL_4B_MODEL_PATH": four_b_file,
+                "MODEL_4B_RELEASE_MANIFEST": four_b_file.with_name("release.manifest.json"),
+                "MODEL_4B_RELEASE_CHECKSUM": four_b_file.with_name(f"{four_b_file.stem}.SHA256SUMS.txt"),
+            }.items():
+                if key not in overrides:
+                    config[key] = value
+            if "LLAMA_MODEL_PATH" not in overrides and not os.getenv("LLAMA_MODEL_PATH"):
+                config["LLAMA_MODEL_PATH"] = default_file
+                config["LLAMA_RELEASE_MANIFEST"] = default_file.with_name("release.manifest.json")
+                config["LLAMA_RELEASE_CHECKSUM"] = default_file.with_name(f"{default_file.stem}.SHA256SUMS.txt")
+    selection_file = Path(str(config["MODELS_DIR"])) / "active_model.json"
+    if "LLAMA_MODEL_PATH" not in (overrides or {}) and not os.getenv("LLAMA_MODEL_PATH"):
+        try:
+            selected_id = json.loads(selection_file.read_text(encoding="utf-8")).get("modelId")
+        except (OSError, ValueError, AttributeError):
+            selected_id = None
+        if selected_id == FOUR_B_MODEL_ID and Path(str(config["MODEL_4B_MODEL_PATH"])).is_file() and Path(str(config["MODEL_4B_RELEASE_CHECKSUM"])).is_file():
+            config["LLAMA_MODEL_PATH"] = config["MODEL_4B_MODEL_PATH"]
+            config["LLAMA_RELEASE_MANIFEST"] = config["MODEL_4B_RELEASE_MANIFEST"]
+            config["LLAMA_RELEASE_CHECKSUM"] = config["MODEL_4B_RELEASE_CHECKSUM"]
     root_dir = Path(config["ROOT_DIR"])
     app = Flask(__name__, static_folder=str(root_dir / "public"), static_url_path="")
     app.config.update(config)
+    # The desktop shell is versioned by the service worker; disable Flask's
+    # long default static cache so a repaired UI is visible after restart.
+    app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
     if app.config.get("MOBILE_MODE") != "local":
         if len(str(app.config.get("MOBILE_PAIRING_CODE", ""))) < 12 or len(str(app.config.get("MOBILE_PAIRING_SECRET", ""))) < 32:
             raise RuntimeError("手机/LAN 模式需要至少 12 位配对码和 32 位签名密钥")
@@ -91,46 +125,72 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
         release_checksum=Path(str(app.config["LLAMA_RELEASE_CHECKSUM"])),
         release_required=bool(app.config["LLAMA_RELEASE_REQUIRED"]),
     )
+    # Model selection is global: the selected, verified model serves ordinary
+    # chat/RAG/Agent requests and the PPT planner.  In particular, choosing 4B
+    # must not silently leave the general chat path on a second 0.8B adapter.
+    # The UI and SSE metrics therefore report the same model for both paths.
+    chat_inference = inference
+    def refresh_general_model() -> None:
+        if inference.model_path.resolve() == Path(str(app.config["MODEL_0P8_MODEL_PATH"])).resolve():
+            inference.refresh_model_file_state()
+
+    def download_root(model_path: object) -> Path:
+        parent = Path(str(model_path)).parent.resolve()
+        default_root = Path(str(app.config["MODELS_DIR"])).resolve()
+        return default_root if parent.is_relative_to(default_root) else parent
+
     model_downloader = ModelReleaseDownloader(
         enabled=bool(app.config["MODEL_RELEASE_DOWNLOAD_ENABLED"]),
         repository=str(app.config["MODEL_RELEASE_REPOSITORY"]),
         release_tag=str(app.config["MODEL_RELEASE_TAG"]),
-        models_dir=Path(str(app.config["MODELS_DIR"])),
-        model_path=Path(str(app.config["LLAMA_MODEL_PATH"])),
-        manifest_path=Path(str(app.config["LLAMA_RELEASE_MANIFEST"])),
-        checksum_path=Path(str(app.config["LLAMA_RELEASE_CHECKSUM"])),
+        models_dir=download_root(app.config["MODEL_0P8_MODEL_PATH"]),
+        model_path=Path(str(app.config["MODEL_0P8_MODEL_PATH"])),
+        manifest_path=Path(str(app.config["MODEL_0P8_RELEASE_MANIFEST"])),
+        checksum_path=Path(str(app.config["MODEL_0P8_RELEASE_CHECKSUM"])),
         n_ctx=int(app.config["LLAMA_N_CTX"]),
         release_required=bool(app.config["LLAMA_RELEASE_REQUIRED"]),
         timeout_seconds=int(app.config["MODEL_DOWNLOAD_TIMEOUT_SECONDS"]),
         max_bytes=int(app.config["MODEL_DOWNLOAD_MAX_BYTES"]),
-        on_installed=inference.refresh_model_file_state,
-        can_replace=inference.can_replace_model_file,
+        on_installed=refresh_general_model,
+        can_replace=lambda: inference.model_path.resolve() != Path(str(app.config["MODEL_0P8_MODEL_PATH"])).resolve() or inference.can_replace_model_file(),
+        pinned_sha256=ZERO_EIGHT_B_SHA256,
+        mirror_repository=str(app.config.get("MODEL_MODELSCOPE_0P8_REPOSITORY") or ""),
+        mirror_verified=bool(app.config.get("MODEL_MODELSCOPE_0P8_VERIFIED")),
     )
     four_b_downloader = ModelReleaseDownloader(
         enabled=bool(app.config["MODEL_4B_DOWNLOAD_ENABLED"]),
         repository=str(app.config["MODEL_RELEASE_REPOSITORY"]),
         release_tag=str(app.config["MODEL_4B_RELEASE_TAG"]),
-        models_dir=Path(str(app.config["MODELS_DIR"])),
+        models_dir=download_root(app.config["MODEL_4B_MODEL_PATH"]),
         model_path=Path(str(app.config["MODEL_4B_MODEL_PATH"])),
         manifest_path=Path(str(app.config["MODEL_4B_RELEASE_MANIFEST"])),
         checksum_path=Path(str(app.config["MODEL_4B_RELEASE_CHECKSUM"])),
         n_ctx=int(app.config["LLAMA_N_CTX"]),
-        # A 4B model is not considered downloadable until its release manifest
-        # and acceptance gate are explicitly enabled by the maintainer.
         release_required=True,
         timeout_seconds=int(app.config["MODEL_DOWNLOAD_TIMEOUT_SECONDS"]),
-        max_bytes=int(app.config["MODEL_DOWNLOAD_MAX_BYTES"]),
-        can_replace=inference.can_replace_model_file,
+        max_bytes=max(int(app.config["MODEL_DOWNLOAD_MAX_BYTES"]), 2_708_804_288),
+        can_replace=lambda: inference.model_path != Path(str(app.config["MODEL_4B_MODEL_PATH"])) or inference.can_replace_model_file(),
+        pinned_parts=FOUR_B_PARTS,
+        pinned_sha256=FOUR_B_SHA256,
+        mirror_repository=str(app.config.get("MODEL_MODELSCOPE_4B_REPOSITORY") or ""),
+        mirror_verified=bool(app.config.get("MODEL_MODELSCOPE_4B_VERIFIED")),
     )
-    model_downloaders = {"default": model_downloader, FOUR_B_MODEL_ID: four_b_downloader}
+    model_downloaders = {
+        "default": model_downloader,
+        "qwen3.5-0.8b-office": model_downloader,
+        FOUR_B_MODEL_ID: four_b_downloader,
+    }
     ppt_service = PptService(
         database, Path(app.config["DATA_DIR"]), inference, int(app.config["MAX_UPLOAD_BYTES"]), int(app.config["MAX_PPTX_SLIDES"]),
         allow_external_renderer=not bool(app.config["TESTING"]),
+        four_b_accepted=bool(app.config.get("MODEL_4B_ACCEPTANCE_PASSED", False)),
     )
 
     def runtime_status() -> dict[str, Any]:
         return {
             "model": inference.status(),
+            "chatModel": chat_inference.status(),
+            "modelRoutingNotice": "已选择 4B：普通对话、RAG、Agent 与 PPT 编辑均使用 4B。" if chat_inference is inference and inference.model_path.resolve() == Path(str(app.config["MODEL_4B_MODEL_PATH"])).resolve() else "",
             "modelDownload": model_downloader.status(),
             "models": build_model_catalog(app.config, inference, model_downloaders),
             "rag": rag.status(),
@@ -151,7 +211,7 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
         }
 
     agent = AgentOrchestrator(
-        database, rag, inference, runtime_status, rag_top_k=int(app.config["RAG_TOP_K"]),
+        database, rag, chat_inference, runtime_status, rag_top_k=int(app.config["RAG_TOP_K"]),
         confirmation_ttl_seconds=int(app.config["AGENT_CONFIRMATION_TTL_SECONDS"]),
         user_id=str(app.config["AGENT_LOCAL_USER_ID"]),
         schedule_timezone=str(app.config["SCHEDULE_TIMEZONE"]),
@@ -161,8 +221,10 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
     app.extensions["rag"] = rag
     app.extensions["agent"] = agent
     app.extensions["inference"] = inference
+    app.extensions["chat_inference"] = chat_inference
     app.extensions["model_downloader"] = model_downloader
     app.extensions["model_downloaders"] = model_downloaders
+    app.extensions["model_storage_lock"] = threading.RLock()
     app.extensions["runtime_status"] = runtime_status
     app.extensions["ppt"] = ppt_service
     app.register_blueprint(create_ppt_blueprint(ppt_service))
@@ -242,7 +304,8 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
         if payload not in (None, {}):
             return error("UNTRUSTED_MODEL_DOWNLOAD_PAYLOAD", "模型下载不接受自定义链接或路径", 400)
         try:
-            return jsonify({"item": model_downloader.start()}), 202
+            with app.extensions["model_storage_lock"]:
+                return jsonify({"item": model_downloader.start()}), 202
         except ModelDownloadError as exc:
             return error("MODEL_DOWNLOAD_UNAVAILABLE", str(exc), 409)
 
@@ -260,16 +323,46 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
     @app.post("/api/v1/models/<model_id>/download")
     def start_model_profile_download(model_id: str) -> Response:
         payload = request.get_json(silent=True)
-        if payload not in (None, {}):
+        if payload not in (None, {}) and (not isinstance(payload, dict) or set(payload) != {"sourceId"} or payload["sourceId"] not in {"github", "modelscope"}):
             return error("UNTRUSTED_MODEL_DOWNLOAD_PAYLOAD", "模型下载不接受自定义链接或路径", 400)
         downloader = model_downloaders.get(model_id)
         if downloader is None:
             return error("MODEL_NOT_FOUND", "未找到该模型配置", 404)
         try:
-            return jsonify({"item": downloader.start(), "modelId": model_id}), 202
+            selected_source = (payload or {}).get("sourceId")
+            with app.extensions["model_storage_lock"]:
+                return jsonify({"item": downloader.start(selected_source), "modelId": model_id}), 202
         except ModelDownloadError as exc:
             code = "MODEL_RELEASE_NOT_READY" if model_id == FOUR_B_MODEL_ID and not app.config["MODEL_4B_DOWNLOAD_ENABLED"] else "MODEL_DOWNLOAD_UNAVAILABLE"
-            return error(code, str(exc) if app.config["MODEL_4B_DOWNLOAD_ENABLED"] or model_id != FOUR_B_MODEL_ID else "4B 模型仍在开发和验收中，当前 Release 尚未开放下载", 409)
+            return error(code, str(exc), 409)
+
+    @app.post("/api/v1/models/<model_id>/activate")
+    def activate_model_profile(model_id: str) -> Response:
+        if request.get_json(silent=True) not in (None, {}):
+            return error("UNTRUSTED_MODEL_SELECTION_PAYLOAD", "模型切换只接受固定模型 ID", 400)
+        if model_id not in {"qwen3.5-0.8b-office", FOUR_B_MODEL_ID}:
+            return error("MODEL_NOT_FOUND", "未找到该模型配置", 404)
+        path = Path(str(app.config["MODEL_4B_MODEL_PATH"] if model_id == FOUR_B_MODEL_ID else model_downloader.model_path))
+        checksum = Path(str(app.config["MODEL_4B_RELEASE_CHECKSUM"] if model_id == FOUR_B_MODEL_ID else model_downloader.checksum_path))
+        if not path.is_file() or not checksum.is_file():
+            return error("MODEL_NOT_VERIFIED", "模型文件或校验记录缺失，请先完成下载", 409)
+        if model_id == FOUR_B_MODEL_ID:
+            expected = FOUR_B_SHA256
+        else:
+            try:
+                expected = next(line.split()[0].lower() for line in checksum.read_text(encoding="utf-8").splitlines()
+                                if len(line.split()) >= 2 and line.split()[-1].lstrip("*") == path.name)
+            except (OSError, StopIteration, UnicodeError):
+                return error("MODEL_NOT_VERIFIED", "模型校验记录无效", 409)
+        with path.open("rb") as handle:
+            actual = hashlib.file_digest(handle, "sha256").hexdigest()
+        if actual != expected:
+            return error("MODEL_HASH_MISMATCH", "模型文件 SHA-256 不匹配，已阻止切换", 409)
+        selection_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary = selection_file.with_suffix(".pending")
+        temporary.write_text(json.dumps({"modelId": model_id}), encoding="utf-8")
+        os.replace(temporary, selection_file)
+        return jsonify({"item": {"modelId": model_id, "restartRequired": True, "message": "已选择模型；重启 Windows 应用后生效。4B 仍是预发布试用模型。"}})
 
     @app.get("/api/v1/preferences")
     def get_preferences() -> Response:
@@ -414,6 +507,22 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
     def conversations() -> Response:
         return jsonify({"items": database.list_conversations()})
 
+    @app.get("/api/v1/workspace/export")
+    def export_workspace_text() -> Response:
+        # Export readable user content only, never auth, settings or model paths.
+        documents = []
+        for summary in database.list_documents(limit=100000):
+            document = database.get_document(summary["id"])
+            if document:
+                documents.append({key: document.get(key) for key in ("id", "name", "content", "created_at")})
+        conversations = [database.get_conversation(item["id"]) for item in database.list_conversations()]
+        response = jsonify({"format": "edge-office-text-archive/1", "appVersion": app.config["APP_VERSION"],
+                            "includes": ["conversation_text", "extracted_document_text"],
+                            "excludes": ["models", "original_files", "ppt_versions", "settings", "credentials"],
+                            "documents": documents, "conversations": conversations})
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     @app.post("/api/v1/conversations")
     def create_conversation() -> Response:
         return jsonify({"item": database.create_conversation()}), 201
@@ -490,6 +599,11 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
     @app.post("/api/v1/chat/stream")
     def chat_stream() -> Response:
         payload = request.get_json(silent=True) or {}
+        from .chat_context import chat_context
+        try:
+            task, document_ids, rag_enabled = chat_context(payload, database)
+        except PlanValidationError as exc:
+            return error(exc.code, str(exc), 400)
         message = str(payload.get("message") or "").strip()
         display_message = str(payload.get("displayMessage") or message).strip()
         if not message:
@@ -501,13 +615,12 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
             conversation_id = database.create_conversation()["id"]
         if not database.get_conversation(conversation_id):
             return error("CONVERSATION_NOT_FOUND", "会话不存在", 404)
-        rag_enabled = payload.get("ragEnabled") is not False
         database.add_message(conversation_id, "user", display_message)
 
         def generate() -> Generator[str, None, None]:
             began = time.perf_counter()
             request_id = str(uuid4())
-            model = inference.status()["name"]
+            model = chat_inference.status()["name"]
             yield sse("meta", {
                 "requestId": request_id,
                 "conversationId": conversation_id,
@@ -517,7 +630,7 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
             })
             yield sse("stage", {"name": "agent", "label": "正在规划本地办公任务"})
             try:
-                answer, citations, run, agent_events = agent.execute(message, conversation_id, rag_enabled, request_id=request_id, session_id=g.local_session_id)
+                answer, citations, run, agent_events = agent.execute(message, conversation_id, rag_enabled, request_id=request_id, session_id=g.local_session_id, document_ids=document_ids, task=task)
                 for item in agent_events:
                     yield sse(item["event"], item["data"])
                 if citations:
@@ -543,6 +656,12 @@ def create_app(overrides: dict[str, object] | None = None) -> Flask:
                     "peakRssMb": process_memory_mb(),
                     "agentAction": run["action"],
                     "ragEnabled": rag_enabled,
+                    "answerKind": timings.get("answerKind", "awaiting_confirmation" if run.get("plan", {}).get("status") == "AWAITING_CONFIRMATION" else "tool_result"),
+                    "documentIds": document_ids,
+                    "modelName": model,
+                    "modelRoutingNotice": "已选择 4B：普通对话、RAG、Agent 与 PPT 编辑均使用 4B。" if chat_inference is inference and inference.model_path.resolve() == Path(str(app.config["MODEL_4B_MODEL_PATH"])).resolve() else "",
+                    "fallbackReason": timings.get("fallbackReason"),
+                    "fallbackCode": timings.get("fallbackCode"),
                 }
                 database.add_message(conversation_id, "assistant", emitted, citations, metrics)
                 yield sse("metrics", metrics)

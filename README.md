@@ -1,6 +1,6 @@
 # 微知 Edge Office · Flask + SQLite + FAISS Demo
 
-当前源码开发标识：`0.2.0-dev.20260925`（尚非新安装包或手机 App 正式版）。[完整历史版本说明](CHANGELOG.md) 区分模型 Release、Windows 本地安装包和源码状态。
+当前源码开发标识：`0.2.0-dev.20261013`（Windows `v0.2.0-preview.6` 与 Android `0.2.0-dev.20261013` 为本机试用构建，尚非正式版）。[完整历史版本说明](CHANGELOG.md) 区分模型 Release、Windows 本地安装包和源码状态。PPT 修改确认后自动保存工作副本，原件与撤销记录后台保留；手机支持五类受限操作及离线结构预览。详见 [PPT 与窗口修复说明](docs/ppt-workspace-fixes.md)。
 
 ## 发布节奏
 
@@ -64,6 +64,17 @@ POST /api/v1/presentations/{id}/versions/{version_id}/restore
 
 ## 启动
 
+首次从 GitHub 获取源码时，需要先准备本地依赖（模型权重不在源码仓库中）：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+npm ci
+npm run mobile:parser
+```
+
+`mobile:parser` 会生成手机文件解析/PPT 模块及 PDF.js 静态依赖；这些生成文件不作为模型或个人材料上传。Android 构建另需 JDK 21、Android SDK/NDK，llama.cpp 核心源代码与许可证位于 `android/third_party/`。
+
 在此目录打开 PowerShell：
 
 ```powershell
@@ -86,9 +97,9 @@ python run_flask.py
 
 Windows 版不需要用户安装 Node.js 或 Python。程序安装后会启动本地 Flask 服务，并通过 Windows Edge WebView2 在独立应用窗口中显示界面，不会打开默认浏览器；关闭应用窗口会停止服务。Windows 10/11 通常已自带 WebView2 Runtime，如启动时提示缺少 WebView2，再安装 Microsoft Edge WebView2 Runtime 即可。
 
-运行时数据不会写入安装目录，而是保存在 `%LOCALAPPDATA%\EdgeOffice\artifacts\`：SQLite 数据库在 `data/`，FAISS 索引在 `indexes/`，模型在 `models/`。卸载程序不会删除这些用户材料。
+运行时数据不会写入安装目录，而是保存在 `%LOCALAPPDATA%\EdgeOffice\artifacts\`：SQLite 数据库在 `data/`，FAISS 索引在 `indexes/`。安装向导允许分别选择软件和默认模型目录；默认模型目录为 `artifacts/models/`，模型中心也可以为尚未下载的模型选择位置。已下载模型不自动搬家。卸载程序不会删除这些用户材料。
 
-GGUF 模型单独从 GitHub Releases 下载，避免让安装包额外增加约 812 MB。模型不可用时，应用顶部会显示“下载本地模型”按钮；点击后 Flask 只会从 `liangyanlun/edge-office` 的已配置 Release 下载，完成 SHA-256 校验后自动写入：
+GGUF 模型单独下载，不随源码或安装包分发。模型中心提供固定的 GitHub Releases 和国内 ModelScope 来源，优先使用已核验的国内镜像；不接受任意 URL。下载完成后校验 SHA-256 并写入所选模型目录。未另选目录时，0.8B 默认位置为：
 
 ```text
 %LOCALAPPDATA%\EdgeOffice\artifacts\models\qwen3_5_0p8_office_q8_0\
@@ -111,9 +122,11 @@ Release 至少需要上传同名 GGUF 资源 `Qwen3.5-0.8B-office.Q8_0.gguf`，�
 
 默认固定下载已验证的 `v0.1.0` Release，避免首次下载受 GitHub 匿名 API 限流影响；维护者可通过 `MODEL_RELEASE_TAG` 覆盖目标标签。`MODEL_RELEASE_REPOSITORY` 默认是 `liangyanlun/edge-office`，浏览器端不接受自定义下载链接或保存路径。
 
-### 4B 模型入口（开发中）
+### 4B PPT-SFT 预发布模型
 
-工作台首页的“模型中心”已经预留 `Qwen3.5 Office 4B` 入口，固定指向 [v0.2.0-4b Release](https://github.com/liangyanlun/edge-office/releases/tag/v0.2.0-4b)。当前 Release 只有开发说明，没有 GGUF 文件，因此软件会显示“开发中”并禁止下载，避免误报 404 或安装不完整模型。模型完成验收后，将 `Qwen3.5-4B-office.Q4_K_M.gguf`、`release.manifest.json` 和同名 `SHA256SUMS.txt` 上传到该 Release，并在受控配置中设置 `MODEL_4B_DOWNLOAD_ENABLED=true`，入口即可启用固定地址下载和 SHA-256 校验。4B 文件会保存到 `artifacts/models/qwen3_5_4b_office_q4_k_m/`，不会覆盖 0.8B 模型。
+模型中心固定指向 [v0.2.0-4b Release](https://github.com/liangyanlun/edge-office/releases/tag/v0.2.0-4b)，目前包含两个 `Qwen3.5-4B-PPT.Q4_K_M.gguf.part-*` 分片。Windows 自动顺序下载，逐片比对内置 SHA-256，拼接后再校验完整 GGUF 的 SHA-256 `31af22f3791eefaef07c431378b9e417d45895458b36e81063289892bb037f38`，安装到 `artifacts/models/qwen3_5_4b_office_q4_k_m/`，不覆盖 0.8B。模型中心选择 4B 后需重启 Windows App 生效；可用相同入口切回 0.8B。下载无需 GitHub API 令牌，必须联网；安装与推理离线。
+
+该 Release 仍是预发布：量化能力回归和手机性能验收尚未完成。下载及试用不等于 PPT 专项通过验收；PPT 工作区继续提示核对计划和预览，不自动执行或越过确认。安装包不包含 4B 权重，首次下载约 2.71 GB；手机分片合并期间需要额外空间。
 
 维护者在已安装 Inno Setup 6 的 Windows 环境运行：
 
@@ -121,7 +134,9 @@ Release 至少需要上传同名 GGUF 资源 `Qwen3.5-0.8B-office.Q8_0.gguf`，�
 .\packaging\build.ps1
 ```
 
-当前安装包脚本仍标记 `v0.1.2`，输出 `dist-installer\EdgeOffice-Setup-v0.1.2.exe`；本次源码更新未重新打包。仅生成便携版可执行目录时运行 `.\packaging\build.ps1 -SkipInstaller`。
+本次试用安装包脚本标记 `v0.2.0-preview.6`，输出 `dist-installer\EdgeOffice-Setup-v0.2.0-preview.6.exe`；安装向导分别选择软件安装目录和模型目录，应用内每个模型下载前也可选择位置。它与模型 Release 版本线不同。仅生成便携版可执行目录时运行 `.\packaging\build.ps1 -SkipInstaller`。
+
+Windows 构建与 `npm run mobile:sync` 会先将白名单内的应用资源暂存到 `build/release-public`，不复制 `public` 下无关的本地 HTML、测试文件、模型和数据库。用户数据仍保存在本机运行目录，升级不清空已有材料和模型。本轮修复及 1024 token 动态输出预算见 [模型运行修复说明](docs/model-runtime-fixes.md)。
 
 ## 手机访问与 PWA
 
@@ -144,15 +159,17 @@ python run_flask.py
 
 ## Capacitor 手机 App
 
-项目已生成 `android/` 和 `ios/` 原生工程。Capacitor 外壳复用 `public/` 的移动界面，手机端通过构建时的 `EDGE_OFFICE_SERVER_URL` 连接云端或局域网 Flask 服务，不把 RAG、FAISS、SQLite 或 PPT 执行器复制到手机。
+Android 当前提供独立离线工作区：本地材料、对话保存在手机，内置 llama.cpp JNI 推理；不需要 Flask 地址。手机端支持批量导入 TXT、Markdown、PDF（有文本层）、DOCX、XLSX、CSV、PPTX、HTML、JSON，在本机解析后建立轻量索引，检索引用保留 PDF 页码、Word 段落、PPT 页码、Excel 工作表及行号。每次最多选 10 份，单文件 40 MB；解析失败的文件不会写入索引，其余文件继续导入。扫描 PDF 尚无手机端 OCR；旧版 DOC/XLS/PPT 请先转换为 DOCX/XLSX/PPTX。独立「PPT 编辑」入口支持五类受限编辑、结构预览、确认自动保存、历史撤销及 PPTX 导出/分享（单个编辑文件 20 MB）；安装模型后无需连接电脑。手机预览不是 PowerPoint 原版渲染，母版、图表和复杂样式须导出核对。iOS 工程已同步界面，但不能视为已完成同等原生离线推理能力。知识库导入只保存提取文本与定位信息；PPT 编辑则单独保留原件与工作副本。
+
+模型中心固定提供 GitHub Releases 和“国内镜像 · 魔搭 ModelScope”两个来源。0.8B/4B 分别固定指向 `liangyl233/edge_model_0.8b` 和 `liangyl233/edge_model_4b`。截至 2026-09-30，公开仓库的文件大小、SHA-256 元数据和分段下载已核对，源码默认开放两个入口；客户端下载后仍逐文件验证完整 SHA-256。详情见 [国内模型镜像说明](docs/model-mirror-modelscope.md)：
 
 ```powershell
-$env:EDGE_OFFICE_SERVER_URL="https://你的服务地址"
-npx cap sync
-npx cap open android
+npm run mobile:sync
+cd android
+./gradlew assembleDebug -PedgeOfficeModelScope0p8Verified=true -PedgeOfficeModelScope4bVerified=true
 ```
 
-也可以直接执行 `npm run mobile:sync`。Android 构建需要 Android Studio/SDK；iOS 构建必须在 macOS + Xcode 上完成。没有设置 `EDGE_OFFICE_SERVER_URL` 时，App 会在首次启动时要求用户输入后端地址。
+0.8B 仓库根目录包含 `Qwen3.5-0.8B-office.Q8_0.gguf`；4B 仓库包含两个固定名称的分片。0.8B 和 4B 哈希均固定在 APK 中，分片下载支持断点续传，不接收用户随意填写的下载 URL。若镜像文件将来撤下或更换，应在新构建中把对应 `Verified` 开关设为 `false`。下载阶段需要网络，安装后模型推理不需要联网。Android 构建需要 Android Studio/SDK；正式发布还需独立签名与真机测试。
 
 ## 测试
 

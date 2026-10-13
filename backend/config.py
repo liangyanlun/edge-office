@@ -4,6 +4,8 @@ import os
 import sys
 from pathlib import Path
 
+from .desktop_storage import read_storage_preferences
+
 
 def _resource_root() -> Path:
     """Return bundled resources when frozen, otherwise the source checkout."""
@@ -29,19 +31,34 @@ def _runtime_root() -> Path:
 def default_config() -> dict[str, object]:
     runtime_root = _runtime_root()
     artifacts = runtime_root / "artifacts"
-    default_embedding_model = artifacts / "models" / "bge-small-zh-v1.5"
-    default_model_dir = artifacts / "models" / "qwen3_5_0p8_office_q8_0"
+    models_root = artifacts / "models"
+    if getattr(sys, "frozen", False) and os.name == "nt":
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\EdgeOffice") as key:
+                installed_root = winreg.QueryValueEx(key, "ModelsDirectory")[0]
+            if isinstance(installed_root, str) and Path(installed_root).is_absolute():
+                models_root = Path(installed_root)
+        except OSError:
+            pass
+    if os.getenv("EDGE_OFFICE_MODELS_DIR", "").strip():
+        models_root = Path(os.environ["EDGE_OFFICE_MODELS_DIR"]).expanduser().resolve()
+    storage_settings = artifacts / "data" / "desktop_storage.json"
+    preferences = read_storage_preferences(storage_settings)
+    default_embedding_model = models_root / "bge-small-zh-v1.5"
+    default_model_dir = Path(preferences.get("qwen3.5-0.8b-office", str(models_root / "qwen3_5_0p8_office_q8_0")))
     default_model_file = default_model_dir / "Qwen3.5-0.8B-office.Q8_0.gguf"
-    four_b_model_dir = artifacts / "models" / "qwen3_5_4b_office_q4_k_m"
-    four_b_model_file = four_b_model_dir / "Qwen3.5-4B-office.Q4_K_M.gguf"
+    four_b_model_dir = Path(preferences.get("qwen3.5-4b-office", str(models_root / "qwen3_5_4b_office_q4_k_m")))
+    four_b_model_file = four_b_model_dir / "Qwen3.5-4B-PPT.Q4_K_M.gguf"
     release_required_default = "false" if getattr(sys, "frozen", False) else "true"
     return {
-        "APP_VERSION": "0.2.0-dev.20260925",
+        "APP_VERSION": "0.2.0-dev.20261013",
         "ROOT_DIR": ROOT_DIR,
         "RUNTIME_DIR": runtime_root,
         "DATA_DIR": artifacts / "data",
         "INDEX_DIR": artifacts / "indexes",
-        "MODELS_DIR": artifacts / "models",
+        "MODELS_DIR": models_root,
+        "MODEL_STORAGE_SETTINGS": storage_settings,
         "DATABASE_PATH": artifacts / "data" / "edge_office.db",
         # Chinese edge RAG default: BAAI/bge-small-zh-v1.5 (~96 MB weights).
         # It is downloaded once into artifacts/models and always loaded locally.
@@ -58,6 +75,9 @@ def default_config() -> dict[str, object]:
         # llama.cpp runs inside the Flask process. The GGUF file stays outside
         # source control and can be replaced with LLAMA_MODEL_PATH.
         "LLAMA_CPP_ENABLED": os.getenv("LLAMA_CPP_ENABLED", "true").lower() in {"1", "true", "yes"},
+        "MODEL_0P8_MODEL_PATH": str(default_model_file),
+        "MODEL_0P8_RELEASE_MANIFEST": str(default_model_dir / "release.manifest.json"),
+        "MODEL_0P8_RELEASE_CHECKSUM": str(default_model_dir / f"{default_model_file.stem}.SHA256SUMS.txt"),
         "LLAMA_MODEL_PATH": os.getenv(
             "LLAMA_MODEL_PATH",
             str(default_model_file),
@@ -75,13 +95,17 @@ def default_config() -> dict[str, object]:
         # browser never provides a URL or a destination path.
         "MODEL_RELEASE_DOWNLOAD_ENABLED": os.getenv("MODEL_RELEASE_DOWNLOAD_ENABLED", "true").lower() in {"1", "true", "yes"},
         "MODEL_RELEASE_REPOSITORY": os.getenv("MODEL_RELEASE_REPOSITORY", "liangyanlun/edge-office"),
+        # Public ModelScope files were checked against pinned size/SHA-256 metadata
+        # and byte-range downloads on 2026-09-30. Installation still rehashes bytes.
+        "MODEL_MODELSCOPE_0P8_REPOSITORY": os.getenv("MODEL_MODELSCOPE_0P8_REPOSITORY", "liangyl233/edge_model_0.8b").strip(),
+        "MODEL_MODELSCOPE_4B_REPOSITORY": os.getenv("MODEL_MODELSCOPE_4B_REPOSITORY", "liangyl233/edge_model_4b").strip(),
+        "MODEL_MODELSCOPE_0P8_VERIFIED": os.getenv("MODEL_MODELSCOPE_0P8_VERIFIED", "true").lower() in {"1", "true", "yes"},
+        "MODEL_MODELSCOPE_4B_VERIFIED": os.getenv("MODEL_MODELSCOPE_4B_VERIFIED", "true").lower() in {"1", "true", "yes"},
         # Pin the public model release so first-run downloads do not depend on
         # GitHub's unauthenticated API quota. Maintainers can still override it.
         "MODEL_RELEASE_TAG": os.getenv("MODEL_RELEASE_TAG", "v0.1.0").strip(),
-        # The 4B Release is intentionally a visible, disabled placeholder until
-        # the GGUF, manifest and checksum have passed the separate 4B/PPT gate.
-        # Enabling this flag later exposes the same fixed-asset downloader without
-        # changing the repository or accepting a browser-provided URL.
+        # The 4B PPT-SFT pre-release is pinned by all part and merged hashes.
+        # Download is available for opt-in testing; PPT acceptance remains separate.
         "MODEL_4B_MODEL_PATH": os.getenv("MODEL_4B_MODEL_PATH", str(four_b_model_file)),
         "MODEL_4B_RELEASE_MANIFEST": os.getenv(
             "MODEL_4B_RELEASE_MANIFEST", str(four_b_model_dir / "release.manifest.json")
@@ -90,7 +114,8 @@ def default_config() -> dict[str, object]:
             "MODEL_4B_RELEASE_CHECKSUM", str(four_b_model_dir / f"{four_b_model_file.stem}.SHA256SUMS.txt")
         ),
         "MODEL_4B_RELEASE_TAG": os.getenv("MODEL_4B_RELEASE_TAG", "v0.2.0-4b").strip(),
-        "MODEL_4B_DOWNLOAD_ENABLED": os.getenv("MODEL_4B_DOWNLOAD_ENABLED", "false").lower() in {"1", "true", "yes"},
+        "MODEL_4B_DOWNLOAD_ENABLED": os.getenv("MODEL_4B_DOWNLOAD_ENABLED", "true").lower() in {"1", "true", "yes"},
+        "MODEL_4B_ACCEPTANCE_PASSED": False,
         "MODEL_DOWNLOAD_TIMEOUT_SECONDS": int(os.getenv("MODEL_DOWNLOAD_TIMEOUT_SECONDS", "30")),
         "MODEL_DOWNLOAD_MAX_BYTES": int(os.getenv("MODEL_DOWNLOAD_MAX_BYTES", str(2 * 1024 * 1024 * 1024))),
         "LLAMA_N_CTX": int(os.getenv("LLAMA_N_CTX", "2048")),

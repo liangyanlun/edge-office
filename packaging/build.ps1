@@ -1,22 +1,33 @@
 [CmdletBinding()]
 param(
-    [switch]$SkipInstaller
+    [switch]$SkipInstaller,
+    [string]$OutputRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$BuildOutputRoot = $ProjectRoot
+if ($OutputRoot) {
+    $BuildOutputRoot = [IO.Path]::GetFullPath($OutputRoot)
+    if (-not $BuildOutputRoot.StartsWith($ProjectRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "独立构建目录必须位于项目目录内。"
+    }
+}
+$BuildDist = Join-Path $BuildOutputRoot "dist"
+$BuildWork = Join-Path $BuildOutputRoot "build"
+$InstallerOutput = Join-Path $BuildOutputRoot "dist-installer"
 $Python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 $DataSeparator = [IO.Path]::PathSeparator
-$PublicData = "--add-data=" + (Join-Path $ProjectRoot "public") + $DataSeparator + "public"
+$PublicData = "--add-data=" + (Join-Path $ProjectRoot "build\release-public") + $DataSeparator + "public"
 $ModelReadmeData = "--add-data=" + (Join-Path $ProjectRoot "artifacts\models\README.md") + $DataSeparator + "artifacts\models"
 $LlamaLibraryDir = Join-Path $ProjectRoot ".venv\Lib\site-packages\llama_cpp\lib"
 $PyInstallerArgs = @(
     "-m", "PyInstaller",
     "--noconfirm", "--clean", "--windowed",
     "--name", "EdgeOffice",
-    "--distpath", (Join-Path $ProjectRoot "dist"),
-    "--workpath", (Join-Path $ProjectRoot "build"),
-    "--specpath", (Join-Path $ProjectRoot "build"),
+    "--distpath", $BuildDist,
+    "--workpath", $BuildWork,
+    "--specpath", $BuildWork,
     $PublicData,
     $ModelReadmeData,
     "--collect-all", "sentence_transformers",
@@ -45,6 +56,16 @@ if (-not (Test-Path -LiteralPath $LlamaLibraryDir)) {
 $LlamaDllArgs = Get-ChildItem -LiteralPath $LlamaLibraryDir -Filter *.dll -File | ForEach-Object {
     "--add-binary=$($_.FullName)$DataSeparator" + "llama_cpp\lib"
 }
+
+# Stage only app-shell files.  Never bundle unrelated local HTML, test files,
+# uploaded originals, conversations, indexes, or model weights from the workspace.
+Push-Location $ProjectRoot
+try {
+    & npm.cmd run release:assets
+    if ($LASTEXITCODE -ne 0) { throw "应用静态资源暂存失败。" }
+} finally {
+    Pop-Location
+}
 if (-not $LlamaDllArgs) {
     throw "llama.cpp 原生 DLL 不完整，无法生成可运行安装包。"
 }
@@ -60,7 +81,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 if ($SkipInstaller) {
-    Write-Host "已生成便携版：$ProjectRoot\dist\EdgeOffice\EdgeOffice.exe"
+    Write-Host "已生成便携版：$BuildDist\EdgeOffice\EdgeOffice.exe"
     exit 0
 }
 
@@ -74,9 +95,10 @@ if (-not $IsccCandidates) {
     throw "未找到 Inno Setup 6。请安装后再次运行 packaging\build.ps1。"
 }
 
-& ($IsccCandidates[0]) (Join-Path $PSScriptRoot "EdgeOffice.iss")
+New-Item -ItemType Directory -Path $InstallerOutput -Force | Out-Null
+& ($IsccCandidates[0]) "/DMyAppDistDir=$(Join-Path $BuildDist 'EdgeOffice')" "/O$InstallerOutput" (Join-Path $PSScriptRoot "EdgeOffice.iss")
 if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup 安装包构建失败。"
 }
 
-Write-Host "已生成安装包：$ProjectRoot\dist-installer\EdgeOffice-Setup-v0.1.2.exe"
+Write-Host "已生成安装包：$InstallerOutput\EdgeOffice-Setup-v0.2.0-preview.6.exe"

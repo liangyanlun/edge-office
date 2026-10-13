@@ -5,7 +5,8 @@ const apiServer = process.env.EDGE_OFFICE_SERVER_URL?.trim();
 const config: CapacitorConfig = {
   appId: "com.edgeoffice.app",
   appName: "微知 Edge Office",
-  webDir: "public",
+  // mobile:sync creates a clean, allow-listed app shell before Capacitor copies.
+  webDir: "build/release-public",
   bundledWebRuntime: false,
   plugins: {
     SplashScreen: {

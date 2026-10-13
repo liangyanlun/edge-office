@@ -234,16 +234,28 @@ class AgentOrchestrator:
             return select("respond_without_tool")
         return select("document_search")
 
-    def execute(self, message: str, conversation_id: str, rag_enabled: bool, request_id: str | None = None, session_id: str | None = None) -> tuple[str, list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
+    def execute(self, message: str, conversation_id: str, rag_enabled: bool, request_id: str | None = None, session_id: str | None = None, document_ids: list[str] | None = None, task: str | None = None) -> tuple[str, list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
         request_id = request_id or secrets.token_hex(16)
         planning_started = time.perf_counter()
-        plan = self.plan(message, conversation_id, rag_enabled, request_id, session_id=session_id)
+        if task:
+            # Explicit UI tasks are read/write text operations, never tool commands.
+            arguments = {"query": message, "top_k": self.rag_top_k}
+            canonical = canonical_json({"tool": "document_search", "arguments": arguments, "documentIds": document_ids, "task": task})
+            plan = self.database.create_agent_plan(
+                request_id=request_id, conversation_id=conversation_id, tool="document_search", arguments=arguments,
+                canonical_json=canonical, plan_sha256=hashlib.sha256(canonical.encode()).hexdigest(),
+                risk_class="read_only", policy_version=POLICY_VERSION, model_name=self.inference.status()["name"],
+                model_output_sha256=hashlib.sha256(b"server-ui-task").hexdigest(),
+                request_input_sha256=hashlib.sha256(message.encode()).hexdigest(), status="VALIDATED",
+            )
+        else:
+            plan = self.plan(message, conversation_id, rag_enabled, request_id, session_id=session_id)
         planning_ms = max(1, round((time.perf_counter() - planning_started) * 1000))
         tool = TOOL_REGISTRY[plan["tool"]]
         events = [{"event": "plan", "data": self._plan_event(plan)}]
         if plan["status"] == "AWAITING_CONFIRMATION":
             return self._preview(plan), [], {"action": tool.legacy_action, "tool": tool.name, "durationMs": 0, "runId": plan["id"], "plan": plan, "timings": {"planningMs": planning_ms}}, events
-        answer, citations, duration_ms, timings = self._execute_plan(plan, rag_enabled, request_id)
+        answer, citations, duration_ms, timings = self._execute_plan(plan, rag_enabled, request_id, document_ids=document_ids, task=task)
         timings["planningMs"] = planning_ms
         events += [{"event": "tool_start", "data": {"action": tool.name, "label": tool.label}}, {"event": "tool_result", "data": {"action": tool.name, "durationMs": duration_ms}}]
         return answer, citations, {"action": tool.legacy_action, "tool": tool.name, "durationMs": duration_ms, "runId": plan["id"], "plan": self.database.get_agent_plan(plan["id"]), "timings": timings}, events
@@ -284,7 +296,7 @@ class AgentOrchestrator:
             self._pending_confirmations.pop(plan_id, None)
         return self.database.get_agent_plan(plan_id) or {}
 
-    def _execute_plan(self, plan: dict[str, Any], rag_enabled: bool, request_id: str) -> tuple[str, list[dict[str, Any]], int, dict[str, Any]]:
+    def _execute_plan(self, plan: dict[str, Any], rag_enabled: bool, request_id: str, document_ids: list[str] | None = None, task: str | None = None) -> tuple[str, list[dict[str, Any]], int, dict[str, Any]]:
         if plan["tool"] in CALENDAR_TOOLS and not self.calendar_enabled:
             raise PlanValidationError("FEATURE_UNAVAILABLE", CALENDAR_UNAVAILABLE_MESSAGE)
         current = self.database.get_agent_plan(plan["id"])
@@ -306,12 +318,21 @@ class AgentOrchestrator:
             if tool in {"document_search", "document_quote"}:
                 if rag_enabled:
                     retrieval_started = time.perf_counter()
-                    citations = self.rag.search(arguments["query"], int(arguments.get("top_k", self.rag_top_k)), request_id=request_id)
+                    if task == "compare" and document_ids:
+                        groups = [self.rag.search(arguments["query"], 2, document_ids=[document_id], request_id=request_id) for document_id in document_ids]
+                        # Never claim a comparison when evidence covers only one side.
+                        citations = [item for group in groups for item in group] if all(groups) else []
+                        for index, item in enumerate(citations, 1):
+                            item["citationId"] = index
+                    else:
+                        citations = self.rag.search(arguments["query"], int(arguments.get("top_k", self.rag_top_k)), document_ids=document_ids, request_id=request_id)
                     timings["retrievalMs"] = max(1, round((time.perf_counter() - retrieval_started) * 1000))
                 answer = self.inference.compose_answer(arguments["query"], citations, rag_enabled, "search_knowledge")
                 timings.update(self.inference.last_generation_metrics())
             elif tool == "task_list":
                 docs = self.database.list_documents(keyword=arguments.get("keyword") or None, limit=min(int(arguments.get("limit", 10)), 20))
+                if document_ids is not None:
+                    docs = [doc for doc in docs if doc["id"] in document_ids]
                 answer = self.inference.compose_answer("列出材料", docs, True, "list_documents")
                 timings.update(self.inference.last_generation_metrics())
             elif tool == "calendar_find_slots":
@@ -334,6 +355,7 @@ class AgentOrchestrator:
                     answer = f"已检查本地日程库中的 {len(events)} 项安排，未发现时间重叠。当前仍未连接真实日历。"
             elif tool == "email_create_draft":
                 answer = self.inference.create_draft("邮件", arguments.get("body", ""), arguments.get("tone", "正式"))
+                timings.update(self.inference.last_generation_metrics())
             elif tool in {"calendar_create_draft", "task_create_draft", "task_update_draft"}:
                 answer = self._draft_summary(tool, arguments)
             elif tool == "request_clarification":
@@ -355,6 +377,7 @@ class AgentOrchestrator:
                     )
                     answer = f"已在本地日程库保存：{event['title']}（{event['startAt']}–{event['endAt']}）。当前未连接外部日历。"
             elif tool in HIGH_RISK:
+                timings["answerKind"] = "simulation"
                 answer = f"已在本地沙箱完成“{TOOL_REGISTRY[tool].label}”演练；当前未配置真实外部连接，不会产生邮件、日历、待办或文件副作用。"
             else:
                 raise PlanValidationError("UNKNOWN_TOOL", "未允许的工具")

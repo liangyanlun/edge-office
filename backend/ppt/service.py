@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,7 @@ from .contracts import PptContractError, PptOperation, PptPatch
 from .executor import execute_patch
 from .planner import PptPlanner
 from .policy import validate_patch
-from .renderer import render_presentation
+from .renderer import render_presentation, RENDER_REVISION
 from .snapshot import build_snapshot, load_snapshot, snapshot_for_slide, write_snapshot
 from .storage import PptStorage
 from .verifier import verify_candidate
@@ -30,12 +31,13 @@ class PptServiceError(RuntimeError):
 
 
 class PptService:
-    def __init__(self, database: Database, data_dir: Path, inference: InferenceAdapter, max_upload_bytes: int, max_slides: int = 300, allow_external_renderer: bool = True):
+    def __init__(self, database: Database, data_dir: Path, inference: InferenceAdapter, max_upload_bytes: int, max_slides: int = 300, allow_external_renderer: bool = True, four_b_accepted: bool = False):
         self.storage = PptStorage(database, data_dir)
-        self.planner = PptPlanner(inference)
+        self.planner = PptPlanner(inference, four_b_accepted=four_b_accepted)
         self.max_upload_bytes = max_upload_bytes
         self.max_slides = max_slides
         self.allow_external_renderer = allow_external_renderer
+        self._render_lock = threading.Lock()
 
     def runtime(self) -> dict[str, Any]:
         return {
@@ -83,12 +85,14 @@ class PptService:
         if not item:
             raise PptServiceError("PPT_NOT_FOUND", "演示文稿不存在", 404)
         item["modelCapability"] = self.planner.capability()
+        item["render"] = self._ensure_preview(self._version(presentation_id))
         return item
 
     def slides(self, presentation_id: str) -> dict[str, Any]:
         version = self._version(presentation_id)
         snapshot = load_snapshot(Path(version["snapshotPath"]))
-        return {"presentationId": presentation_id, "versionId": version["id"], "items": self._slides(snapshot)}
+        return {"presentationId": presentation_id, "versionId": version["id"], "items": self._slides(snapshot),
+                "slideSize": snapshot["slideSize"], "render": self._ensure_preview(version)}
 
     def slide_snapshot(self, presentation_id: str, slide_id: str) -> dict[str, Any]:
         version = self._version(presentation_id)
@@ -225,10 +229,26 @@ class PptService:
 
     def preview_file(self, presentation_id: str, version_id: str, slide_id: str) -> Path:
         version = self._version(presentation_id, version_id)
+        try:
+            snapshot_for_slide(load_snapshot(Path(version["snapshotPath"])), slide_id)
+        except KeyError as exc:
+            raise PptServiceError("PPT_SLIDE_NOT_FOUND", "幻灯片不存在", 404) from exc
+        self._ensure_preview(version)
         path = Path(version["slidesDir"]) / f"{slide_id}.png"
         if not path.is_file():
             raise PptServiceError("PPT_PREVIEW_NOT_FOUND", "页面预览不存在", 404)
         return path
+
+    def _ensure_preview(self, version):
+        directory = Path(version["slidesDir"])
+        with self._render_lock:
+            try:
+                info = json.loads((directory / "render.json").read_text(encoding="utf-8"))
+                if info.get("revision") == RENDER_REVISION and all((directory / f"slide-{i}.png").is_file() for i in range(1, info["count"] + 1)):
+                    return info
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+            return render_presentation(Path(version["path"]), directory, self.allow_external_renderer)
 
     def patch_preview_file(self, patch_id: str, slide_id: str) -> Path:
         patch = self._patch(patch_id)

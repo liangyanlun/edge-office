@@ -1,15 +1,17 @@
 {
   "name": "edge-office-demo",
-  "version": "0.2.0-dev.20260925",
+  "version": "0.2.0-dev.20261013",
   "private": true,
   "type": "module",
   "scripts": {
     "start": ".\\.venv\\Scripts\\python.exe run_flask.py",
     "start:node": "node server.mjs",
-    "test": "node --test",
+    "test": "npm run mobile:parser && node --test tests/server.test.mjs tests/mobile-document-parser.test.mjs tests/mobile-ppt.test.mjs tests/model-experience.test.mjs tests/release-assets.test.mjs",
     "test:backend": ".\\.venv\\Scripts\\python.exe -m pytest tests_py",
     "mobile:init": "cap add android && cap add ios",
-    "mobile:sync": "cap sync",
+    "mobile:parser": "node scripts/build-mobile-parser.mjs",
+    "release:assets": "npm run mobile:parser && node scripts/stage-release-assets.mjs",
+    "mobile:sync": "npm run release:assets && cap sync",
     "mobile:open:android": "cap open android",
     "mobile:open:ios": "cap open ios"
   },
@@ -25,9 +27,13 @@
     "@capacitor/preferences": "^8.0.1",
     "@capacitor/share": "^8.0.2",
     "@capacitor/splash-screen": "^8.0.2",
-    "@capacitor/status-bar": "^8.0.3"
+    "@capacitor/status-bar": "^8.0.3",
+    "esbuild": "^0.28.2",
+    "fflate": "^0.8.3",
+    "pdfjs-dist": "^6.3.289"
   },
   "devDependencies": {
+    "linkedom": "^0.18.13",
     "typescript": "^5.9.3"
   }
 }

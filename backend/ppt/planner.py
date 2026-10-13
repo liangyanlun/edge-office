@@ -9,19 +9,23 @@ from .contracts import PptPatch, parse_ppt_calls
 
 
 class PptPlanner:
-    def __init__(self, inference: InferenceAdapter):
+    def __init__(self, inference: InferenceAdapter, four_b_accepted: bool = False):
         self.inference = inference
+        self.four_b_accepted = four_b_accepted
 
     def capability(self) -> dict[str, Any]:
         status = self.inference.status()
         name = str(status.get("name") or "")
         billions = _model_billions(name)
-        recommended = billions is not None and billions >= 4.0
+        preview_4b = "4B-PPT" in name and not self.four_b_accepted
+        recommended = billions is not None and billions >= 4.0 and not preview_4b
         warning = None
         if billions is None:
             warning = "无法识别当前模型参数规模；PPT 编辑建议使用已专项训练并通过评测的 4B 或更大模型。"
         elif billions < 4.0:
             warning = f"当前模型约 {billions:g}B，低于 PPT 编辑建议的 4B；计划可能不完整，确认前请重点核对预览和操作列表。"
+        elif preview_4b:
+            warning = "当前 4B PPT-SFT GGUF 是预发布试用版，量化能力回归尚未通过；PPT 操作必须逐项检查预览与验证结果。"
         return {"model": name, "billions": billions, "recommended": recommended, "warning": warning}
 
     def plan(
@@ -45,7 +49,8 @@ class PptPlanner:
                 "del_paragraph(div_id, paragraph_id)、replace_image(image_id, image_path)、del_image(image_id)。"
                 "ID 必须来自当前页 HTML；图片路径必须从可用 asset://upload/... 中选择；禁止新增幻灯片、表格、图表、备注、动画和母版。"
             )
-            user = f"当前页 HTML：\n{slide_snapshot['html']}\n可用图片资源：{asset_text}\n用户要求：{instruction}"
+            layout = [{"id": item["id"], "kind": item["kind"], "bounds": item.get("bounds"), "editable": item.get("editable", item["kind"] == "image")} for item in slide_snapshot["elements"]]
+            user = f"当前页 HTML：\n{slide_snapshot['html']}\n对象位置（用于辨认左右/上下，不可编辑 unsupported 对象）：{json.dumps(layout, ensure_ascii=False)}\n可用图片资源：{asset_text}\n用户要求：{instruction}"
             raw = self.inference.generate_constrained_text(system, user, max_tokens=512)
         operations = parse_ppt_calls(raw)
         return PptPatch.create(document_id, base_version, slide_id, operations), raw, capability
